@@ -1633,122 +1633,14 @@ AMMR/
 
 ---
 
-# 28. Research Positioning
 
-AMMR is currently a **proposed research extension**.
-
-We must distinguish between existing research and our proposed contribution.
-
-## Use
-
-```text
-We propose...
-We investigate...
-We hypothesize...
-We will evaluate...
-We aim to...
-```
-
-## Avoid Unsupported Claims
-
-Do not claim:
-
-```text
-AMMR improves accuracy by 10%.
-AMMR reduces memory by 50%.
-AMMR is superior to existing methods.
-```
-
-unless experimental results support those claims.
-
-The research must clearly distinguish between:
-
-- Existing research
-- Research gap
-- Proposed method
-- Experimental observations
-- Validated conclusions
-
----
-
-# 29. Explanation for Faculty
-
-The project can be explained in five steps.
-
-## Step 1 — Existing Problem
-
-Transformers become increasingly expensive as sequence length increases.
-
-## Step 2 — Existing Solution
-
-Recent research uses adaptive token retention:
-
-```text
-Token → Keep
-Token → Drop
-```
-
-## Step 3 — Limitation
-
-Binary retention may discard moderately useful contextual information.
-
-## Step 4 — Proposed Solution
-
-We propose:
-
-```text
-Adaptive Multi-Level Memory Retention
-```
-
-Instead of only:
-
-```text
-Keep / Drop
-```
-
-we investigate:
-
-```text
-Discard
-   ↓
-Aggregate
-   ↓
-Compress
-   ↓
-Keep
-```
-
-depending on token importance.
-
-## Step 5 — Validation
-
-We will:
-
-```text
-Reproduce Baseline
-        ↓
-Analyze Baseline
-        ↓
-Identify Limitation
-        ↓
-Implement AMMR
-        ↓
-Compare
-        ↓
-Measure Memory + Performance + Latency
-```
-
-The final conclusion will be based on experimental evidence.
-
----
-
-# 30. Core Research Question
+# 28. Core Research Question
 
 > **Can adaptive multi-level memory retention reduce the memory requirements of Transformer models while preserving useful contextual information better than binary token retention under comparable memory budgets?**
 
 ---
 
-# 31. Research Workflow
+# 29. Research Workflow
 
 ```text
 Research Problem
@@ -1784,7 +1676,7 @@ Final Presentation
 
 ---
 
-# 32. Final Research Philosophy
+# 30. Final Research Philosophy
 
 The project will follow an evidence-based research process:
 
