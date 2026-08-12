@@ -1,4 +1,4 @@
-import os
+ import os
 import random
 import numpy as np
 
@@ -30,7 +30,7 @@ BUDGET_LAMBDA = 0.10
 
 GRADIENT_CLIP = 1.0
 
-SAVE_PATH = "retention_scorer.pt"
+CHECKPOINT_PATH = "retention_scorer.pt"
 
 
 # =====================================================================
@@ -65,12 +65,13 @@ device = torch.device(
 
 
 # =====================================================================
-# UTILITY FUNCTIONS
+# UTILITY
 # =====================================================================
 
 def print_header(title):
 
-    print("\n" + "=" * 80)
+    print()
+    print("=" * 80)
     print(title)
     print("=" * 80)
 
@@ -84,10 +85,10 @@ def count_parameters(model):
 
 
 # =====================================================================
-# STEP 1: LOAD TOKENIZER
+# STEP 1 — LOAD MODEL
 # =====================================================================
 
-print_header("STEP 1: MODEL")
+print_header("STEP 1 — MODEL SETUP")
 
 print("Model:", MODEL_NAME)
 print("Device:", device)
@@ -98,10 +99,6 @@ tokenizer = AutoTokenizer.from_pretrained(
     MODEL_NAME
 )
 
-
-# =====================================================================
-# STEP 2: LOAD PRETRAINED DISTILBERT
-# =====================================================================
 
 qa_model = (
     DistilBertForQuestionAnswering
@@ -114,11 +111,9 @@ qa_model = qa_model.to(device)
 qa_model.eval()
 
 
-# ---------------------------------------------------------------------
-# Freeze the complete pretrained model.
+# Freeze pretrained DistilBERT.
 #
-# We are studying the retention mechanism independently first.
-# ---------------------------------------------------------------------
+# At this stage we train ONLY the retention scorer.
 
 for parameter in qa_model.parameters():
 
@@ -128,16 +123,18 @@ for parameter in qa_model.parameters():
 encoder = qa_model.distilbert
 
 
-print("\nTotal DistilBERT parameters:")
-
 print(
+    "DistilBERT parameters:",
     f"{count_parameters(qa_model):,}"
 )
 
 
 # =====================================================================
-# STEP 3: QUESTION AND CONTEXT
+# STEP 2 — DATA
 # =====================================================================
+
+print_header("STEP 2 — INPUT DATA")
+
 
 question = (
     "What is artificial intelligence?"
@@ -151,15 +148,23 @@ context = (
 )
 
 
-# Ground-truth answer for this demonstration.
-
 answer_text = (
     "a field of computer science"
 )
 
 
+print("Question:")
+print(question)
+
+print("\nContext:")
+print(context)
+
+print("\nAnswer:")
+print(answer_text)
+
+
 # =====================================================================
-# STEP 4: TOKENIZATION
+# STEP 3 — TOKENIZATION
 # =====================================================================
 
 encoded = tokenizer(
@@ -179,16 +184,6 @@ attention_mask = encoded["attention_mask"]
 offset_mapping = encoded["offset_mapping"]
 
 
-# ---------------------------------------------------------------------
-# Determine which tokens belong to which sequence.
-#
-# sequence_ids():
-#
-# None → special token
-# 0    → question
-# 1    → context
-# ---------------------------------------------------------------------
-
 sequence_ids = encoded.sequence_ids(
     batch_index=0
 )
@@ -202,48 +197,49 @@ tokens = tokenizer.convert_ids_to_tokens(
 sequence_length = input_ids.shape[1]
 
 
-print_header("STEP 4: TOKENIZATION")
+model_inputs = {
 
-print(
-    "Sequence length:",
-    sequence_length
-)
+    "input_ids":
+        input_ids.to(device),
+
+    "attention_mask":
+        attention_mask.to(device)
+}
+
+
+print_header("STEP 3 — TOKENIZATION")
 
 
 for index, token in enumerate(tokens):
 
-    sequence_type = sequence_ids[index]
+    sequence_id = sequence_ids[index]
 
-    if sequence_type is None:
 
-        segment = "SPECIAL"
+    if sequence_id is None:
 
-    elif sequence_type == 0:
+        token_type = "SPECIAL"
 
-        segment = "QUESTION"
+    elif sequence_id == 0:
+
+        token_type = "QUESTION"
 
     else:
 
-        segment = "CONTEXT"
+        token_type = "CONTEXT"
 
 
     print(
         f"{index:3d} | "
         f"{token:20s} | "
-        f"{segment}"
+        f"{token_type}"
     )
 
 
-# Move model inputs to device.
-
-model_inputs = {
-    "input_ids": input_ids.to(device),
-    "attention_mask": attention_mask.to(device)
-}
+print("\nSequence length:", sequence_length)
 
 
 # =====================================================================
-# STEP 5: IDENTIFY ANSWER SPAN CORRECTLY
+# STEP 4 — IDENTIFY GROUND-TRUTH ANSWER
 # =====================================================================
 
 answer_start_char = context.find(
@@ -254,7 +250,7 @@ answer_start_char = context.find(
 if answer_start_char == -1:
 
     raise ValueError(
-        "Answer text was not found in context."
+        "Answer not found in context."
     )
 
 
@@ -265,37 +261,35 @@ answer_end_char = (
 )
 
 
-# ---------------------------------------------------------------------
-# Find tokens belonging to the answer.
-#
-# IMPORTANT:
-# We only consider context tokens.
-# ---------------------------------------------------------------------
-
 answer_token_positions = []
 
 
-for index, ((start, end), sequence_id) in enumerate(
+for index, (offset, sequence_id) in enumerate(
     zip(
         offset_mapping[0].tolist(),
         sequence_ids
     )
 ):
 
+    start, end = offset
+
+
+    # Only context tokens.
+
     if sequence_id != 1:
 
         continue
 
 
-    if start is None or end is None:
+    if end <= start:
 
         continue
 
 
     if (
         start >= answer_start_char
-        and end <= answer_end_char
-        and end > start
+        and
+        end <= answer_end_char
     ):
 
         answer_token_positions.append(
@@ -306,7 +300,7 @@ for index, ((start, end), sequence_id) in enumerate(
 if not answer_token_positions:
 
     raise RuntimeError(
-        "Could not locate answer token positions."
+        "Unable to locate answer tokens."
     )
 
 
@@ -334,28 +328,26 @@ end_target = torch.tensor(
 )
 
 
-print_header("STEP 5: GROUND-TRUTH ANSWER")
-
-print(
-    "Answer:",
-    answer_text
+print_header(
+    "STEP 4 — GROUND-TRUTH SPAN"
 )
 
+
 print(
-    "Answer start token:",
+    "Start:",
     start_target_index,
     tokens[start_target_index]
 )
 
 print(
-    "Answer end token:",
+    "End:",
     end_target_index,
     tokens[end_target_index]
 )
 
 
 # =====================================================================
-# STEP 6: DISTILBERT ENCODER
+# STEP 5 — DISTILBERT ENCODER
 # =====================================================================
 
 with torch.no_grad():
@@ -381,17 +373,22 @@ hidden_dimension = (
 )
 
 
-print_header("STEP 6: DISTILBERT")
+print_header(
+    "STEP 5 — DISTILBERT REPRESENTATIONS"
+)
+
 
 print(
-    "Final hidden states:",
-    hidden_states.shape
+    "Final hidden state:",
+    tuple(hidden_states.shape)
 )
+
 
 print(
     "Hidden dimension:",
     hidden_dimension
 )
+
 
 print(
     "Transformer layers:",
@@ -399,18 +396,18 @@ print(
 )
 
 
-for layer_index, layer_hidden in enumerate(
+for layer_index, layer in enumerate(
     all_hidden_states
 ):
 
     print(
         f"Layer {layer_index}: "
-        f"{tuple(layer_hidden.shape)}"
+        f"{tuple(layer.shape)}"
     )
 
 
 # =====================================================================
-# STEP 7: BASELINE QA
+# STEP 6 — BASELINE PREDICTION
 # =====================================================================
 
 with torch.no_grad():
@@ -445,13 +442,17 @@ baseline_end = torch.argmax(
 baseline_answer = tokenizer.decode(
     input_ids[
         0,
-        baseline_start:baseline_end + 1
+        baseline_start:
+        baseline_end + 1
     ],
     skip_special_tokens=True
 )
 
 
-print_header("STEP 7: BASELINE QA")
+print_header(
+    "STEP 6 — BASELINE QA"
+)
+
 
 print(
     "Predicted start:",
@@ -470,15 +471,8 @@ print(
 
 
 # =====================================================================
-# STEP 8: CREATE VALID TOKEN MASK
+# STEP 7 — TOKEN MASKS
 # =====================================================================
-
-# We don't want padding or special tokens to consume our
-# retention budget.
-#
-# However, [CLS] and [SEP] are structurally important for
-# Transformer input, so we mark them separately as protected.
-
 
 valid_token_mask = torch.zeros(
     sequence_length,
@@ -496,10 +490,7 @@ for index, sequence_id in enumerate(
     sequence_ids
 ):
 
-    token_id = input_ids[0, index].item()
-
-
-    # Special tokens
+    # Special tokens are protected.
 
     if sequence_id is None:
 
@@ -508,16 +499,12 @@ for index, sequence_id in enumerate(
         continue
 
 
-    # Question or context token
+    # Question/context tokens are adaptive.
 
     if attention_mask[0, index].item() == 1:
 
         valid_token_mask[index] = True
 
-
-# ---------------------------------------------------------------------
-# Memory-budget tokens are only normal question/context tokens.
-# ---------------------------------------------------------------------
 
 budget_token_count = (
     valid_token_mask.sum().item()
@@ -533,7 +520,10 @@ target_budget = max(
 )
 
 
-print_header("STEP 8: MEMORY BUDGET")
+print_header(
+    "STEP 7 — RETENTION BUDGET"
+)
+
 
 print(
     "Total sequence tokens:",
@@ -541,7 +531,7 @@ print(
 )
 
 print(
-    "Budget-eligible tokens:",
+    "Adaptive tokens:",
     budget_token_count
 )
 
@@ -557,23 +547,26 @@ print(
 
 
 # =====================================================================
-# STEP 9: LEARNABLE RETENTION SCORER
+# STEP 8 — RETENTION SCORER
 # =====================================================================
 
 class RetentionScorer(nn.Module):
 
     """
-    Learnable token importance network.
+    Learnable token retention network.
 
-    Input:
-        h_t ∈ R^768
+    h_t
+      ↓
+    MLP
+      ↓
+    score s_t
+      ↓
+    sigmoid
+      ↓
+    p_t
 
-    Output:
-        s_t ∈ R
-
-    Retention probability:
-
-        p_t = sigmoid(s_t)
+    p_t represents the probability/strength
+    of retaining token t.
     """
 
     def __init__(
@@ -615,9 +608,7 @@ class RetentionScorer(nn.Module):
         )
 
 
-        # Start with a neutral probability.
-        #
-        # sigmoid(0) = 0.5
+        # Neutral initialization.
 
         nn.init.zeros_(
             self.network[-1].weight
@@ -653,7 +644,7 @@ class RetentionScorer(nn.Module):
 
 
 # =====================================================================
-# STEP 10: CREATE RETENTION MODEL
+# STEP 9 — CREATE RETENTION SCORER
 # =====================================================================
 
 retention_scorer = RetentionScorer(
@@ -661,9 +652,13 @@ retention_scorer = RetentionScorer(
 ).to(device)
 
 
-print_header("STEP 10: RETENTION SCORER")
+print_header(
+    "STEP 9 — RETENTION SCORER"
+)
+
 
 print(retention_scorer)
+
 
 print(
     "\nTrainable parameters:",
@@ -672,21 +667,19 @@ print(
 
 
 # =====================================================================
-# STEP 11: RETENTION PROBABILITY FUNCTION
+# STEP 10 — RETENTION PROBABILITY FUNCTION
 # =====================================================================
 
-def get_retention_probabilities(
-    scorer,
+def get_probabilities(
     hidden_states,
+    scorer,
     protected_mask
 ):
 
-    scores, probabilities = scorer(
-        hidden_states
+    scores, probabilities = (
+        scorer(hidden_states)
     )
 
-
-    # Protected tokens must remain active.
 
     protected_mask = (
         protected_mask
@@ -694,9 +687,16 @@ def get_retention_probabilities(
     )
 
 
+    # Protected tokens always remain active.
+
     probabilities = torch.where(
+
         protected_mask.unsqueeze(0),
-        torch.ones_like(probabilities),
+
+        torch.ones_like(
+            probabilities
+        ),
+
         probabilities
     )
 
@@ -708,10 +708,26 @@ def get_retention_probabilities(
 
 
 # =====================================================================
-# STEP 12: BUDGET LOSS
+# STEP 11 — SOFT RETENTION
 # =====================================================================
 
-def calculate_budget_loss(
+def apply_soft_retention(
+    hidden_states,
+    probabilities
+):
+
+    return (
+        hidden_states
+        *
+        probabilities.unsqueeze(-1)
+    )
+
+
+# =====================================================================
+# STEP 12 — MEMORY OBJECTIVE
+# =====================================================================
+
+def budget_loss(
     probabilities,
     valid_mask,
     target_budget
@@ -723,9 +739,6 @@ def calculate_budget_loss(
     )
 
 
-    # Only count tokens that are eligible
-    # for adaptive retention.
-
     expected_tokens = (
         probabilities
         *
@@ -733,7 +746,7 @@ def calculate_budget_loss(
     ).sum(dim=-1)
 
 
-    # Penalize excess memory.
+    # Penalize exceeding the budget.
 
     excess = F.relu(
         expected_tokens
@@ -742,49 +755,22 @@ def calculate_budget_loss(
     )
 
 
-    budget_loss = (
+    loss = (
         excess ** 2
     ).mean()
 
 
     return (
-        budget_loss,
+        loss,
         expected_tokens
     )
 
 
 # =====================================================================
-# STEP 13: SOFT RETENTION
+# STEP 13 — QA OBJECTIVE
 # =====================================================================
 
-def apply_soft_retention(
-    hidden_states,
-    probabilities
-):
-
-    """
-    Soft retention:
-
-        h'_t = p_t h_t
-
-    This is differentiable.
-
-    IMPORTANT:
-    This does not physically remove tokens.
-    """
-
-    return (
-        hidden_states
-        *
-        probabilities.unsqueeze(-1)
-    )
-
-
-# =====================================================================
-# STEP 14: TASK LOSS
-# =====================================================================
-
-def calculate_task_loss(
+def qa_loss(
     gated_hidden_states
 ):
 
@@ -810,7 +796,7 @@ def calculate_task_loss(
     )
 
 
-    task_loss = (
+    loss = (
         start_loss
         +
         end_loss
@@ -818,14 +804,14 @@ def calculate_task_loss(
 
 
     return (
-        task_loss,
+        loss,
         start_logits,
         end_logits
     )
 
 
 # =====================================================================
-# STEP 15: OPTIMIZER
+# STEP 14 — OPTIMIZER
 # =====================================================================
 
 optimizer = torch.optim.AdamW(
@@ -836,10 +822,13 @@ optimizer = torch.optim.AdamW(
 
 
 # =====================================================================
-# STEP 16: TRAINING
+# STEP 15 — TRAIN RETENTION SCORER
 # =====================================================================
 
-print_header("STEP 16: TRAINING RETENTION SCORER")
+print_header(
+    "STEP 15 — TRAINING"
+)
+
 
 retention_scorer.train()
 
@@ -855,20 +844,20 @@ for step in range(
 
 
     # ---------------------------------------------------------------
-    # Calculate probabilities
+    # Retention probabilities
     # ---------------------------------------------------------------
 
     scores, probabilities = (
-        get_retention_probabilities(
-            retention_scorer,
+        get_probabilities(
             hidden_states,
+            retention_scorer,
             protected_token_mask
         )
     )
 
 
     # ---------------------------------------------------------------
-    # Apply soft gate
+    # Soft retention
     # ---------------------------------------------------------------
 
     gated_hidden_states = (
@@ -880,26 +869,26 @@ for step in range(
 
 
     # ---------------------------------------------------------------
-    # Task loss
+    # QA loss
     # ---------------------------------------------------------------
 
     (
         task_loss,
         start_logits,
         end_logits
-    ) = calculate_task_loss(
+    ) = qa_loss(
         gated_hidden_states
     )
 
 
     # ---------------------------------------------------------------
-    # Memory loss
+    # Budget loss
     # ---------------------------------------------------------------
 
     (
-        budget_loss,
+        memory_loss,
         expected_tokens
-    ) = calculate_budget_loss(
+    ) = budget_loss(
         probabilities,
         valid_token_mask,
         target_budget
@@ -907,7 +896,7 @@ for step in range(
 
 
     # ---------------------------------------------------------------
-    # Total objective
+    # Total loss
     # ---------------------------------------------------------------
 
     total_loss = (
@@ -915,7 +904,7 @@ for step in range(
         +
         BUDGET_LAMBDA
         *
-        budget_loss
+        memory_loss
     )
 
 
@@ -925,10 +914,6 @@ for step in range(
 
     total_loss.backward()
 
-
-    # ---------------------------------------------------------------
-    # Gradient clipping
-    # ---------------------------------------------------------------
 
     gradient_norm = (
         torch.nn.utils.clip_grad_norm_(
@@ -954,17 +939,17 @@ for step in range(
         print(
             f"Step {step:4d} | "
             f"Total={total_loss.item():.5f} | "
-            f"Task={task_loss.item():.5f} | "
-            f"Budget={budget_loss.item():.5f} | "
+            f"QA={task_loss.item():.5f} | "
+            f"Budget={memory_loss.item():.5f} | "
             f"ExpectedTokens="
-            f"{expected_tokens.mean().item():.3f} | "
-            f"GradNorm="
+            f"{expected_tokens.item():.3f} | "
+            f"Grad="
             f"{float(gradient_norm):.4f}"
         )
 
 
 # =====================================================================
-# STEP 17: FINAL RETENTION PROBABILITIES
+# STEP 16 — FINAL PROBABILITIES
 # =====================================================================
 
 retention_scorer.eval()
@@ -973,24 +958,26 @@ retention_scorer.eval()
 with torch.no_grad():
 
     final_scores, final_probabilities = (
-        get_retention_probabilities(
-            retention_scorer,
+        get_probabilities(
             hidden_states,
+            retention_scorer,
             protected_token_mask
         )
     )
 
 
 print_header(
-    "STEP 17: FINAL RETENTION PROBABILITIES"
+    "STEP 16 — LEARNED RETENTION PROBABILITIES"
 )
 
 
 for index, token in enumerate(tokens):
 
     probability = (
-        final_probabilities[0, index]
-        .item()
+        final_probabilities[
+            0,
+            index
+        ].item()
     )
 
 
@@ -1016,25 +1003,26 @@ for index, token in enumerate(tokens):
 
 
 # =====================================================================
-# STEP 18: MEMORY ANALYSIS
+# STEP 17 — EXPECTED MEMORY
 # =====================================================================
 
 with torch.no_grad():
 
-    expected_retained_tokens = (
-        (
-            final_probabilities
-            *
-            valid_token_mask
-            .to(device)
-            .unsqueeze(0)
-        )
-        .sum()
-        .item()
+    adaptive_mask = (
+        valid_token_mask
+        .to(device)
+        .unsqueeze(0)
     )
 
 
-expected_retention_ratio = (
+    expected_retained_tokens = (
+        final_probabilities
+        *
+        adaptive_mask
+    ).sum().item()
+
+
+expected_ratio = (
     expected_retained_tokens
     /
     budget_token_count
@@ -1042,17 +1030,17 @@ expected_retention_ratio = (
 
 
 print_header(
-    "STEP 18: MEMORY ANALYSIS"
+    "STEP 17 — MEMORY ANALYSIS"
 )
 
 
 print(
-    "Budget-eligible tokens:",
+    "Adaptive tokens:",
     budget_token_count
 )
 
 print(
-    "Target retained tokens:",
+    "Target tokens:",
     target_budget
 )
 
@@ -1063,22 +1051,21 @@ print(
 
 print(
     "Expected retention ratio:",
-    f"{expected_retention_ratio:.4f}"
+    f"{expected_ratio * 100:.2f}%"
 )
 
 
 # =====================================================================
-# STEP 19: LEARNED TOKEN RANKING
+# STEP 18 — LEARNED RANKING
 # =====================================================================
-
-print_header(
-    "STEP 19: LEARNED TOKEN IMPORTANCE RANKING"
-)
-
 
 adaptive_indices = [
     index
-    for index in range(sequence_length)
+
+    for index in range(
+        sequence_length
+    )
+
     if valid_token_mask[index]
 ]
 
@@ -1089,12 +1076,19 @@ adaptive_indices.sort(
             0,
             index
         ].item(),
+
     reverse=True
 )
 
 
+print_header(
+    "STEP 18 — LEARNED TOKEN RANKING"
+)
+
+
 for rank, index in enumerate(
-    adaptive_indices
+    adaptive_indices,
+    start=1
 ):
 
     probability = (
@@ -1106,7 +1100,7 @@ for rank, index in enumerate(
 
 
     print(
-        f"{rank + 1:3d} | "
+        f"{rank:3d} | "
         f"Position={index:2d} | "
         f"Token={tokens[index]:20s} | "
         f"P={probability:.4f}"
@@ -1114,17 +1108,8 @@ for rank, index in enumerate(
 
 
 # =====================================================================
-# STEP 20: TOP-K INTERPRETATION
+# STEP 19 — TOP-K INTERPRETATION
 # =====================================================================
-#
-# This is NOT stochastic Bernoulli sampling.
-#
-# It is simply a deterministic interpretation:
-#
-# "If we were allowed to retain K tokens, which ones would
-#  the learned scorer choose?"
-#
-
 
 top_k = min(
     target_budget,
@@ -1132,18 +1117,13 @@ top_k = min(
 )
 
 
-selected_indices = (
+selected_indices = set(
     adaptive_indices[:top_k]
 )
 
 
-selected_index_set = set(
-    selected_indices
-)
-
-
 print_header(
-    "STEP 20: TOP-K INTERPRETATION"
+    "STEP 19 — TOP-K INTERPRETATION"
 )
 
 
@@ -1153,16 +1133,21 @@ print(
 )
 
 
-for index in range(sequence_length):
+for index, token in enumerate(tokens):
 
-    token = tokens[index]
+    probability = (
+        final_probabilities[
+            0,
+            index
+        ].item()
+    )
 
 
     if protected_token_mask[index]:
 
         status = "PROTECTED"
 
-    elif index in selected_index_set:
+    elif index in selected_indices:
 
         status = "KEEP"
 
@@ -1175,14 +1160,6 @@ for index in range(sequence_length):
         status = "IGNORE"
 
 
-    probability = (
-        final_probabilities[
-            0,
-            index
-        ].item()
-    )
-
-
     print(
         f"{index:3d} | "
         f"{token:20s} | "
@@ -1192,7 +1169,7 @@ for index in range(sequence_length):
 
 
 # =====================================================================
-# STEP 21: SOFT-GATED QA
+# STEP 20 — SOFT-GATED QA
 # =====================================================================
 
 with torch.no_grad():
@@ -1239,7 +1216,8 @@ if gated_end >= gated_start:
     gated_answer = tokenizer.decode(
         input_ids[
             0,
-            gated_start:gated_end + 1
+            gated_start:
+            gated_end + 1
         ],
         skip_special_tokens=True
     )
@@ -1250,7 +1228,7 @@ else:
 
 
 print_header(
-    "STEP 21: SOFT-GATED QA"
+    "STEP 20 — SOFT-GATED QA"
 )
 
 
@@ -1260,22 +1238,22 @@ print(
 )
 
 print(
-    "Baseline prediction:",
+    "Baseline:",
     baseline_answer
 )
 
 print(
-    "Retention prediction:",
+    "After retention:",
     gated_answer
 )
 
 
 # =====================================================================
-# STEP 22: ANSWER TOKEN RETENTION CHECK
+# STEP 21 — ANSWER TOKEN RETENTION
 # =====================================================================
 
 print_header(
-    "STEP 22: ANSWER TOKEN RETENTION"
+    "STEP 21 — ANSWER TOKEN RETENTION"
 )
 
 
@@ -1284,11 +1262,6 @@ answer_probabilities = (
         0,
         answer_token_positions
     ]
-)
-
-
-print(
-    "Answer tokens:"
 )
 
 
@@ -1302,34 +1275,50 @@ for index in answer_token_positions:
 
 
 print(
-    "\nAverage answer-token retention:",
+    "\nAverage answer-token probability:",
     f"{answer_probabilities.mean().item():.4f}"
 )
 
 
 # =====================================================================
-# STEP 23: SAVE RETENTION SCORER
+# STEP 22 — SAVE CHECKPOINT
 # =====================================================================
 
+checkpoint = {
+
+    "model_name":
+        MODEL_NAME,
+
+    "hidden_dimension":
+        hidden_dimension,
+
+    "retention_ratio":
+        RETENTION_RATIO,
+
+    "target_budget":
+        target_budget,
+
+    "state_dict":
+        retention_scorer.state_dict()
+}
+
+
 torch.save(
-    {
-        "model_name": MODEL_NAME,
-        "hidden_dimension": hidden_dimension,
-        "retention_ratio": RETENTION_RATIO,
-        "state_dict": retention_scorer.state_dict()
-    },
-    SAVE_PATH
+    checkpoint,
+    CHECKPOINT_PATH
 )
 
 
 print_header(
-    "STEP 23: MODEL SAVED"
+    "STEP 22 — CHECKPOINT"
 )
 
 
 print(
-    "Saved retention scorer to:",
-    os.path.abspath(SAVE_PATH)
+    "Saved to:",
+    os.path.abspath(
+        CHECKPOINT_PATH
+    )
 )
 
 
@@ -1338,12 +1327,12 @@ print(
 # =====================================================================
 
 print_header(
-    "FINAL SUMMARY"
+    "FINAL EXPERIMENT SUMMARY"
 )
 
 
 print(
-    "Pretrained model:",
+    "Model:",
     MODEL_NAME
 )
 
@@ -1358,7 +1347,7 @@ print(
 )
 
 print(
-    "Budget-eligible tokens:",
+    "Adaptive tokens:",
     budget_token_count
 )
 
@@ -1379,11 +1368,11 @@ print(
 
 print(
     "Expected retention:",
-    f"{expected_retention_ratio * 100:.2f}%"
+    f"{expected_ratio * 100:.2f}%"
 )
 
 print(
-    "Ground-truth answer:",
+    "Ground truth:",
     answer_text
 )
 
