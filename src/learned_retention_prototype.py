@@ -1442,9 +1442,3 @@ print(
     baseline_answer
 )
 
-print(
-    "Soft-gated answer:",
-    gated_answer
-)
-
-print("=" * 80)
