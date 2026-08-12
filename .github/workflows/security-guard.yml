@@ -1,0 +1,31 @@
+name: Security Guard Blocker
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+jobs:
+  enforce-security:
+    # This ensures it ONLY triggers if your friend is the one who caused the code to land on main
+    if: |
+      github.actor == 'kotigaribharath-byte' && 
+      (github.event_name == 'push' || github.event.pull_request.merged == true)
+    
+    runs-on: ubuntu-latest
+    steps:
+      - name: Revoke Write Permissions and Block User
+        uses: ssendon/revoke-collaborator-access-action@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          username: 'kotigaribharath-byte'
+
+      - name: Log Security Event
+        run: |
+          echo "❌ Security Guard triggered! kotigaribharath-byte modified the main branch."
+          echo "🔒 Their access has been revoked. They are now blocked from further pushes."
+          exit 1
