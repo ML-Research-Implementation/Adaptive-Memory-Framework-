@@ -18,23 +18,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Revoke Write Permissions and Block User
-        env:
-          # Storing the variables cleanly as environment flags to fix curl syntax
-          REPO_PATH: ${{ github.repository }}
-          ADMIN_TOKEN: ${{ secrets.REPO_ADMIN_PAT }}
+        uses: ssendon/revoke-collaborator-access-action@v1
+        with:
+          # Automatically uses the built-in system permission token
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          username: 'kotigaribharath-byte'
+
+      - name: Log Security Event
         run: |
-          echo "⚠️ Unauthorized code modification on main branch detected!"
-          echo "Triggered by: ${{ github.actor }} via ${{ github.event_name }}"
-          
-          # Executing clean API call using env variables
-          curl -L \
-            -X PUT \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer $ADMIN_TOKEN" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            "https://github.com" \
-            -d '{"permission":"read"}'
-            
-          echo "❌ kotigaribharath-byte has been downgraded to READ-ONLY."
-          echo "🔒 They are now completely blocked from pushing or merging anything else."
+          echo "❌ Security Guard triggered! kotigaribharath-byte has been removed from the repository."
+          echo "🔒 They are completely blocked from pushing or merging code until unblocked."
           exit 1
