@@ -28,6 +28,10 @@ TRAINING_STEPS = 500
 
 BUDGET_LAMBDA = 0.10
 
+ENTROPY_LAMBDA = 0.001
+
+TEMPERATURE = 1.0
+
 GRADIENT_CLIP = 1.0
 
 CHECKPOINT_PATH = "retention_scorer.pt"
@@ -40,13 +44,10 @@ CHECKPOINT_PATH = "retention_scorer.pt"
 def set_seed(seed):
 
     random.seed(seed)
-
     np.random.seed(seed)
-
     torch.manual_seed(seed)
 
     if torch.cuda.is_available():
-
         torch.cuda.manual_seed_all(seed)
 
 
@@ -111,9 +112,8 @@ qa_model = qa_model.to(device)
 qa_model.eval()
 
 
-# Freeze pretrained DistilBERT.
-#
-# At this stage we train ONLY the retention scorer.
+# Freeze pretrained model.
+# Only the retention scorer will be trained.
 
 for parameter in qa_model.parameters():
 
@@ -130,7 +130,7 @@ print(
 
 
 # =====================================================================
-# STEP 2 — DATA
+# STEP 2 — INPUT
 # =====================================================================
 
 print_header("STEP 2 — INPUT DATA")
@@ -159,7 +159,7 @@ print(question)
 print("\nContext:")
 print(context)
 
-print("\nAnswer:")
+print("\nGround-truth answer:")
 print(answer_text)
 
 
@@ -182,7 +182,6 @@ input_ids = encoded["input_ids"]
 attention_mask = encoded["attention_mask"]
 
 offset_mapping = encoded["offset_mapping"]
-
 
 sequence_ids = encoded.sequence_ids(
     batch_index=0
@@ -214,19 +213,14 @@ for index, token in enumerate(tokens):
 
     sequence_id = sequence_ids[index]
 
-
     if sequence_id is None:
-
         token_type = "SPECIAL"
 
     elif sequence_id == 0:
-
         token_type = "QUESTION"
 
     else:
-
         token_type = "CONTEXT"
-
 
     print(
         f"{index:3d} | "
@@ -239,7 +233,7 @@ print("\nSequence length:", sequence_length)
 
 
 # =====================================================================
-# STEP 4 — IDENTIFY GROUND-TRUTH ANSWER
+# STEP 4 — FIND GROUND-TRUTH ANSWER SPAN
 # =====================================================================
 
 answer_start_char = context.find(
@@ -250,14 +244,13 @@ answer_start_char = context.find(
 if answer_start_char == -1:
 
     raise ValueError(
-        "Answer not found in context."
+        "Ground-truth answer was not found in context."
     )
 
 
 answer_end_char = (
     answer_start_char
-    +
-    len(answer_text)
+    + len(answer_text)
 )
 
 
@@ -273,45 +266,34 @@ for index, (offset, sequence_id) in enumerate(
 
     start, end = offset
 
-
     # Only context tokens.
 
     if sequence_id != 1:
-
         continue
 
+    # Ignore empty offsets.
 
     if end <= start:
-
         continue
-
 
     if (
         start >= answer_start_char
-        and
-        end <= answer_end_char
+        and end <= answer_end_char
     ):
 
-        answer_token_positions.append(
-            index
-        )
+        answer_token_positions.append(index)
 
 
 if not answer_token_positions:
 
     raise RuntimeError(
-        "Unable to locate answer tokens."
+        "Could not locate answer tokens."
     )
 
 
-start_target_index = (
-    answer_token_positions[0]
-)
+start_target_index = answer_token_positions[0]
 
-
-end_target_index = (
-    answer_token_positions[-1]
-)
+end_target_index = answer_token_positions[-1]
 
 
 start_target = torch.tensor(
@@ -328,9 +310,7 @@ end_target = torch.tensor(
 )
 
 
-print_header(
-    "STEP 4 — GROUND-TRUTH SPAN"
-)
+print_header("STEP 4 — GROUND-TRUTH SPAN")
 
 
 print(
@@ -347,7 +327,7 @@ print(
 
 
 # =====================================================================
-# STEP 5 — DISTILBERT ENCODER
+# STEP 5 — DISTILBERT REPRESENTATIONS
 # =====================================================================
 
 with torch.no_grad():
@@ -368,9 +348,7 @@ all_hidden_states = (
 )
 
 
-hidden_dimension = (
-    hidden_states.shape[-1]
-)
+hidden_dimension = hidden_states.shape[-1]
 
 
 print_header(
@@ -383,12 +361,10 @@ print(
     tuple(hidden_states.shape)
 )
 
-
 print(
     "Hidden dimension:",
     hidden_dimension
 )
-
 
 print(
     "Transformer layers:",
@@ -407,7 +383,7 @@ for layer_index, layer in enumerate(
 
 
 # =====================================================================
-# STEP 6 — BASELINE PREDICTION
+# STEP 6 — BASELINE QA
 # =====================================================================
 
 with torch.no_grad():
@@ -420,7 +396,6 @@ with torch.no_grad():
 baseline_start_logits = (
     baseline_outputs.start_logits
 )
-
 
 baseline_end_logits = (
     baseline_outputs.end_logits
@@ -442,16 +417,13 @@ baseline_end = torch.argmax(
 baseline_answer = tokenizer.decode(
     input_ids[
         0,
-        baseline_start:
-        baseline_end + 1
+        baseline_start:baseline_end + 1
     ],
     skip_special_tokens=True
 )
 
 
-print_header(
-    "STEP 6 — BASELINE QA"
-)
+print_header("STEP 6 — BASELINE QA")
 
 
 print(
@@ -547,7 +519,7 @@ print(
 
 
 # =====================================================================
-# STEP 8 — RETENTION SCORER
+# STEP 8 — LEARNABLE RETENTION SCORER
 # =====================================================================
 
 class RetentionScorer(nn.Module):
@@ -556,17 +528,16 @@ class RetentionScorer(nn.Module):
     Learnable token retention network.
 
     h_t
-      ↓
+       ↓
     MLP
-      ↓
+       ↓
     score s_t
-      ↓
+       ↓
     sigmoid
-      ↓
+       ↓
     p_t
 
-    p_t represents the probability/strength
-    of retaining token t.
+    p_t = retention probability
     """
 
     def __init__(
@@ -608,7 +579,7 @@ class RetentionScorer(nn.Module):
         )
 
 
-        # Neutral initialization.
+        # Start from approximately p = 0.5.
 
         nn.init.zeros_(
             self.network[-1].weight
@@ -632,8 +603,10 @@ class RetentionScorer(nn.Module):
         scores = scores.squeeze(-1)
 
 
+        # Temperature controls probability sharpness.
+
         probabilities = torch.sigmoid(
-            scores
+            scores / TEMPERATURE
         )
 
 
@@ -644,7 +617,7 @@ class RetentionScorer(nn.Module):
 
 
 # =====================================================================
-# STEP 9 — CREATE RETENTION SCORER
+# STEP 9 — CREATE SCORER
 # =====================================================================
 
 retention_scorer = RetentionScorer(
@@ -667,7 +640,7 @@ print(
 
 
 # =====================================================================
-# STEP 10 — RETENTION PROBABILITY FUNCTION
+# STEP 10 — GET RETENTION PROBABILITIES
 # =====================================================================
 
 def get_probabilities(
@@ -676,8 +649,8 @@ def get_probabilities(
     protected_mask
 ):
 
-    scores, probabilities = (
-        scorer(hidden_states)
+    scores, probabilities = scorer(
+        hidden_states
     )
 
 
@@ -687,7 +660,7 @@ def get_probabilities(
     )
 
 
-    # Protected tokens always remain active.
+    # Special tokens remain fully retained.
 
     probabilities = torch.where(
 
@@ -724,10 +697,10 @@ def apply_soft_retention(
 
 
 # =====================================================================
-# STEP 12 — MEMORY OBJECTIVE
+# STEP 12 — MEMORY LOSS
 # =====================================================================
 
-def budget_loss(
+def calculate_budget_loss(
     probabilities,
     valid_mask,
     target_budget
@@ -745,8 +718,6 @@ def budget_loss(
         valid_mask.unsqueeze(0)
     ).sum(dim=-1)
 
-
-    # Penalize exceeding the budget.
 
     excess = F.relu(
         expected_tokens
@@ -767,10 +738,54 @@ def budget_loss(
 
 
 # =====================================================================
-# STEP 13 — QA OBJECTIVE
+# STEP 13 — ENTROPY REGULARIZATION
 # =====================================================================
 
-def qa_loss(
+def calculate_entropy(
+    probabilities,
+    valid_mask
+):
+
+    valid_mask = (
+        valid_mask
+        .to(probabilities.device)
+    )
+
+
+    p = probabilities.clamp(
+        min=1e-7,
+        max=1 - 1e-7
+    )
+
+
+    entropy = -(
+        p * torch.log(p)
+        +
+        (1 - p)
+        *
+        torch.log(1 - p)
+    )
+
+
+    masked_entropy = (
+        entropy
+        *
+        valid_mask.unsqueeze(0)
+    )
+
+
+    return masked_entropy.sum() / (
+        valid_mask.sum()
+        +
+        1e-8
+    )
+
+
+# =====================================================================
+# STEP 14 — QA LOSS
+# =====================================================================
+
+def calculate_qa_loss(
     gated_hidden_states
 ):
 
@@ -811,7 +826,7 @@ def qa_loss(
 
 
 # =====================================================================
-# STEP 14 — OPTIMIZER
+# STEP 15 — OPTIMIZER
 # =====================================================================
 
 optimizer = torch.optim.AdamW(
@@ -822,11 +837,51 @@ optimizer = torch.optim.AdamW(
 
 
 # =====================================================================
-# STEP 15 — TRAIN RETENTION SCORER
+# STEP 16 — INITIAL PROBABILITIES
+# =====================================================================
+
+retention_scorer.eval()
+
+
+with torch.no_grad():
+
+    _, initial_probabilities = (
+        get_probabilities(
+            hidden_states,
+            retention_scorer,
+            protected_token_mask
+        )
+    )
+
+
+print_header(
+    "STEP 16 — INITIAL PROBABILITIES"
+)
+
+
+for index, token in enumerate(tokens):
+
+    probability = (
+        initial_probabilities[
+            0,
+            index
+        ].item()
+    )
+
+
+    print(
+        f"{index:3d} | "
+        f"{token:20s} | "
+        f"P={probability:.4f}"
+    )
+
+
+# =====================================================================
+# STEP 17 — TRAIN RETENTION SCORER
 # =====================================================================
 
 print_header(
-    "STEP 15 — TRAINING"
+    "STEP 17 — TRAINING"
 )
 
 
@@ -847,7 +902,7 @@ for step in range(
     # Retention probabilities
     # ---------------------------------------------------------------
 
-    scores, probabilities = (
+    _, probabilities = (
         get_probabilities(
             hidden_states,
             retention_scorer,
@@ -869,26 +924,26 @@ for step in range(
 
 
     # ---------------------------------------------------------------
-    # QA loss
+    # QA objective
     # ---------------------------------------------------------------
 
     (
         task_loss,
         start_logits,
         end_logits
-    ) = qa_loss(
+    ) = calculate_qa_loss(
         gated_hidden_states
     )
 
 
     # ---------------------------------------------------------------
-    # Budget loss
+    # Memory objective
     # ---------------------------------------------------------------
 
     (
         memory_loss,
         expected_tokens
-    ) = budget_loss(
+    ) = calculate_budget_loss(
         probabilities,
         valid_token_mask,
         target_budget
@@ -896,15 +951,27 @@ for step in range(
 
 
     # ---------------------------------------------------------------
+    # Entropy
+    # ---------------------------------------------------------------
+
+    entropy = calculate_entropy(
+        probabilities,
+        valid_token_mask
+    )
+
+
+    # ---------------------------------------------------------------
     # Total loss
+    #
+    # We minimize entropy so probabilities become more decisive.
     # ---------------------------------------------------------------
 
     total_loss = (
         task_loss
         +
-        BUDGET_LAMBDA
-        *
-        memory_loss
+        BUDGET_LAMBDA * memory_loss
+        +
+        ENTROPY_LAMBDA * entropy
     )
 
 
@@ -941,7 +1008,8 @@ for step in range(
             f"Total={total_loss.item():.5f} | "
             f"QA={task_loss.item():.5f} | "
             f"Budget={memory_loss.item():.5f} | "
-            f"ExpectedTokens="
+            f"Entropy={entropy.item():.5f} | "
+            f"Expected="
             f"{expected_tokens.item():.3f} | "
             f"Grad="
             f"{float(gradient_norm):.4f}"
@@ -949,7 +1017,7 @@ for step in range(
 
 
 # =====================================================================
-# STEP 16 — FINAL PROBABILITIES
+# STEP 18 — FINAL PROBABILITIES
 # =====================================================================
 
 retention_scorer.eval()
@@ -967,7 +1035,7 @@ with torch.no_grad():
 
 
 print_header(
-    "STEP 16 — LEARNED RETENTION PROBABILITIES"
+    "STEP 18 — FINAL RETENTION PROBABILITIES"
 )
 
 
@@ -1003,7 +1071,7 @@ for index, token in enumerate(tokens):
 
 
 # =====================================================================
-# STEP 17 — EXPECTED MEMORY
+# STEP 19 — MEMORY ANALYSIS
 # =====================================================================
 
 with torch.no_grad():
@@ -1030,7 +1098,7 @@ expected_ratio = (
 
 
 print_header(
-    "STEP 17 — MEMORY ANALYSIS"
+    "STEP 19 — MEMORY ANALYSIS"
 )
 
 
@@ -1045,21 +1113,22 @@ print(
 )
 
 print(
-    "Expected retained tokens:",
+    "Expected retained:",
     f"{expected_retained_tokens:.3f}"
 )
 
 print(
-    "Expected retention ratio:",
+    "Expected retention:",
     f"{expected_ratio * 100:.2f}%"
 )
 
 
 # =====================================================================
-# STEP 18 — LEARNED RANKING
+# STEP 20 — TOKEN RANKING
 # =====================================================================
 
 adaptive_indices = [
+
     index
 
     for index in range(
@@ -1082,7 +1151,7 @@ adaptive_indices.sort(
 
 
 print_header(
-    "STEP 18 — LEARNED TOKEN RANKING"
+    "STEP 20 — LEARNED TOKEN RANKING"
 )
 
 
@@ -1108,7 +1177,7 @@ for rank, index in enumerate(
 
 
 # =====================================================================
-# STEP 19 — TOP-K INTERPRETATION
+# STEP 21 — TOP-K SELECTION
 # =====================================================================
 
 top_k = min(
@@ -1123,7 +1192,7 @@ selected_indices = set(
 
 
 print_header(
-    "STEP 19 — TOP-K INTERPRETATION"
+    "STEP 21 — TOP-K INTERPRETATION"
 )
 
 
@@ -1169,7 +1238,7 @@ for index, token in enumerate(tokens):
 
 
 # =====================================================================
-# STEP 20 — SOFT-GATED QA
+# STEP 22 — SOFT-GATED QA
 # =====================================================================
 
 with torch.no_grad():
@@ -1189,24 +1258,14 @@ with torch.no_grad():
     )
 
 
-gated_start_logits = (
-    gated_logits[..., 0]
-)
-
-
-gated_end_logits = (
-    gated_logits[..., 1]
-)
-
-
 gated_start = torch.argmax(
-    gated_start_logits,
+    gated_logits[..., 0],
     dim=-1
 ).item()
 
 
 gated_end = torch.argmax(
-    gated_end_logits,
+    gated_logits[..., 1],
     dim=-1
 ).item()
 
@@ -1216,8 +1275,7 @@ if gated_end >= gated_start:
     gated_answer = tokenizer.decode(
         input_ids[
             0,
-            gated_start:
-            gated_end + 1
+            gated_start:gated_end + 1
         ],
         skip_special_tokens=True
     )
@@ -1228,7 +1286,7 @@ else:
 
 
 print_header(
-    "STEP 20 — SOFT-GATED QA"
+    "STEP 22 — SOFT-GATED QA"
 )
 
 
@@ -1249,11 +1307,11 @@ print(
 
 
 # =====================================================================
-# STEP 21 — ANSWER TOKEN RETENTION
+# STEP 23 — ANSWER TOKEN ANALYSIS
 # =====================================================================
 
 print_header(
-    "STEP 21 — ANSWER TOKEN RETENTION"
+    "STEP 23 — ANSWER TOKEN RETENTION"
 )
 
 
@@ -1281,7 +1339,7 @@ print(
 
 
 # =====================================================================
-# STEP 22 — SAVE CHECKPOINT
+# STEP 24 — SAVE CHECKPOINT
 # =====================================================================
 
 checkpoint = {
@@ -1298,6 +1356,9 @@ checkpoint = {
     "target_budget":
         target_budget,
 
+    "temperature":
+        TEMPERATURE,
+
     "state_dict":
         retention_scorer.state_dict()
 }
@@ -1310,12 +1371,12 @@ torch.save(
 
 
 print_header(
-    "STEP 22 — CHECKPOINT"
+    "STEP 24 — CHECKPOINT"
 )
 
 
 print(
-    "Saved to:",
+    "Saved:",
     os.path.abspath(
         CHECKPOINT_PATH
     )
@@ -1327,7 +1388,7 @@ print(
 # =====================================================================
 
 print_header(
-    "FINAL EXPERIMENT SUMMARY"
+    "FINAL SUMMARY"
 )
 
 
@@ -1362,7 +1423,7 @@ print(
 )
 
 print(
-    "Expected retained tokens:",
+    "Expected retained:",
     f"{expected_retained_tokens:.3f}"
 )
 
