@@ -12,13 +12,9 @@ $$
 
 where $n$ represents the number of input tokens.
 
-The project starts by reproducing and studying an existing **adaptive binary token-retention approach**. Based on the limitations identified in that approach, we propose an **Adaptive Multi-Level Memory Retention (AMMR)** framework.
+The project starts by reproducing and studying an existing **adaptive binary token-retention approach**. Based on the limitations identified in that approach, we propose an **Adaptive Multi-Level Memory Retention (AMMR)** Framework.
 
-Instead of making only a binary decision:
 
-```text
-KEEP / DROP
-```
 
 AMMR investigates multiple levels of retention:
 
