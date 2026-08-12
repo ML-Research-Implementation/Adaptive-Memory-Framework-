@@ -1437,8 +1437,4 @@ print(
     answer_text
 )
 
-print(
-    "Baseline answer:",
-    baseline_answer
-)
 
