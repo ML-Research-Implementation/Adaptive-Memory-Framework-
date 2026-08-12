@@ -1,28 +1,55 @@
-import torch
+ import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
 from transformers import (
     AutoTokenizer,
     DistilBertForQuestionAnswering
 )
 
 
+# =====================================================================
+# CONFIGURATION
+# =====================================================================
 
 MODEL_NAME = "distilbert-base-uncased-distilled-squad"
+
+RETENTION_RATIO = 0.50
+
+LEARNING_RATE = 1e-3
+
+TRAINING_STEPS = 100
+
+BUDGET_LAMBDA = 0.05
 
 device = torch.device(
     "cuda" if torch.cuda.is_available() else "cpu"
 )
 
-print("=" * 70)
-print("DEVICE")
-print("=" * 70)
 
-print(device)
+# =====================================================================
+# STEP 1: DEVICE
+# =====================================================================
 
+print("=" * 75)
+print("STEP 1: DEVICE")
+print("=" * 75)
+
+print("Device:", device)
+
+
+# =====================================================================
+# STEP 2: LOAD TOKENIZER
+# =====================================================================
 
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_NAME
 )
 
+
+# =====================================================================
+# STEP 3: LOAD PRETRAINED DISTILBERT QA MODEL
+# =====================================================================
 
 qa_model = DistilBertForQuestionAnswering.from_pretrained(
     MODEL_NAME
@@ -33,10 +60,21 @@ qa_model = qa_model.to(device)
 qa_model.eval()
 
 
-# Get the DistilBERT encoder inside the QA model
+# We will initially freeze DistilBERT and the QA head.
+#
+# This lets us study the retention mechanism separately.
+
+for parameter in qa_model.parameters():
+
+    parameter.requires_grad = False
+
 
 encoder = qa_model.distilbert
 
+
+# =====================================================================
+# STEP 4: INPUT
+# =====================================================================
 
 question = "What is artificial intelligence?"
 
@@ -46,6 +84,10 @@ that focuses on creating systems capable of performing
 tasks that normally require human intelligence.
 """
 
+
+# =====================================================================
+# STEP 5: TOKENIZATION
+# =====================================================================
 
 inputs = tokenizer(
     question,
@@ -59,78 +101,68 @@ inputs = {
 }
 
 
-print("\n" + "=" * 70)
-print("STEP 5: TOKENIZATION")
-print("=" * 70)
+input_ids = inputs["input_ids"]
+
+attention_mask = inputs["attention_mask"]
 
 tokens = tokenizer.convert_ids_to_tokens(
-    inputs["input_ids"][0]
+    input_ids[0]
 )
 
+sequence_length = input_ids.shape[1]
+
+
+print("\n" + "=" * 75)
+print("STEP 5: TOKENIZATION")
+print("=" * 75)
+
 print("Tokens:")
-print(tokens)
 
-print("\nInput IDs:")
-print(inputs["input_ids"])
+for index, token in enumerate(tokens):
 
-print("\nInput IDs shape:")
-print(inputs["input_ids"].shape)
+    print(
+        f"{index:2d} -> {token}"
+    )
 
+print("\nInput shape:")
+print(input_ids.shape)
+
+
+# =====================================================================
+# STEP 6: BASELINE DISTILBERT FORWARD PASS
+# =====================================================================
 
 with torch.no_grad():
 
     encoder_outputs = encoder(
-        input_ids=inputs["input_ids"],
-        attention_mask=inputs["attention_mask"]
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True
     )
 
 
 hidden_states = encoder_outputs.last_hidden_state
 
-
-print("\n" + "=" * 70)
-print("STEP 6: DISTILBERT ENCODER")
-print("=" * 70)
-
-print(
-    "Final hidden state shape:",
-    hidden_states.shape
-)
-
-
-batch_size = hidden_states.shape[0]
-sequence_length = hidden_states.shape[1]
-hidden_dimension = hidden_states.shape[2]
-
-
-print("\nBatch size:", batch_size)
-print("Sequence length:", sequence_length)
-print("Hidden dimension:", hidden_dimension)
-
-
-with torch.no_grad():
-
-    encoder_outputs = encoder(
-        input_ids=inputs["input_ids"],
-        attention_mask=inputs["attention_mask"],
-        output_hidden_states=True
-    )
-
-
 all_hidden_states = encoder_outputs.hidden_states
 
 
-print("\n" + "=" * 70)
-print("STEP 7: DISTILBERT LAYER REPRESENTATIONS")
-print("=" * 70)
+print("\n" + "=" * 75)
+print("STEP 6: DISTILBERT REPRESENTATIONS")
+print("=" * 75)
+
+print(
+    "Final hidden state:",
+    hidden_states.shape
+)
 
 print(
     "Number of hidden-state tensors:",
     len(all_hidden_states)
 )
 
-
-for layer_index, layer_hidden in enumerate(all_hidden_states):
+for layer_index, layer_hidden in enumerate(
+    all_hidden_states
+):
 
     print(
         f"Layer {layer_index}: "
@@ -138,305 +170,661 @@ for layer_index, layer_hidden in enumerate(all_hidden_states):
     )
 
 
+# =====================================================================
+# STEP 7: BASELINE QA PREDICTION
+# =====================================================================
 
 with torch.no_grad():
 
-    outputs = qa_model(
+    baseline_outputs = qa_model(
         **inputs
     )
 
 
-start_logits = outputs.start_logits
-end_logits = outputs.end_logits
+baseline_start_logits = baseline_outputs.start_logits
+
+baseline_end_logits = baseline_outputs.end_logits
 
 
-print("\n" + "=" * 70)
-print("STEP 8: QUESTION ANSWERING")
-print("=" * 70)
-
-print(
-    "Start logits shape:",
-    start_logits.shape
-)
-
-print(
-    "End logits shape:",
-    end_logits.shape
-)
-
-
-
-start_index = torch.argmax(
-    start_logits,
+baseline_start = torch.argmax(
+    baseline_start_logits,
     dim=-1
 ).item()
 
-end_index = torch.argmax(
-    end_logits,
+baseline_end = torch.argmax(
+    baseline_end_logits,
     dim=-1
 ).item()
 
 
-print(
-    "\nPredicted start index:",
-    start_index
-)
-
-print(
-    "Predicted end index:",
-    end_index
-)
-
-
-
-answer_tokens = inputs["input_ids"][
-    0,
-    start_index:end_index + 1
-]
-
-
-answer = tokenizer.decode(
-    answer_tokens,
+baseline_answer = tokenizer.decode(
+    input_ids[0, baseline_start:baseline_end + 1],
     skip_special_tokens=True
 )
 
 
-print("\n" + "=" * 70)
-print("STEP 10: PREDICTED ANSWER")
-print("=" * 70)
+print("\n" + "=" * 75)
+print("STEP 7: BASELINE QA")
+print("=" * 75)
 
-print(answer)
+print("Start index:", baseline_start)
 
+print("End index:", baseline_end)
 
-
-print("\n" + "=" * 70)
-print("STEP 11: TOKEN IMPORTANCE ANALYSIS")
-print("=" * 70)
+print("Answer:", baseline_answer)
 
 
-# We use the final Transformer layer.
+# =====================================================================
+# STEP 8: LEARNABLE RETENTION SCORER
+# =====================================================================
 
-final_layer = all_hidden_states[-1]
+class RetentionScorer(nn.Module):
 
+    """
+    Learnable token-retention scorer.
+
+    Input:
+        h_t ∈ R^768
+
+    Output:
+        s_t ∈ R
+
+    Then:
+
+        p_t = sigmoid(s_t)
+
+    where p_t represents the learned probability/
+    strength of retaining token t.
+    """
+
+    def __init__(self, hidden_dimension):
+
+        super().__init__()
+
+        self.scorer = nn.Sequential(
+
+            nn.Linear(
+                hidden_dimension,
+                hidden_dimension // 4
+            ),
+
+            nn.ReLU(),
+
+            nn.Linear(
+                hidden_dimension // 4,
+                1
+            )
+        )
+
+
+    def forward(self, hidden_states):
+
+        # hidden_states:
+        #
+        # [batch, sequence_length, hidden_dimension]
+
+        scores = self.scorer(
+            hidden_states
+        )
+
+        # [batch, sequence_length, 1]
+        scores = scores.squeeze(-1)
+
+        # [batch, sequence_length]
+        probabilities = torch.sigmoid(
+            scores
+        )
+
+        return scores, probabilities
+
+
+# =====================================================================
+# STEP 9: CREATE RETENTION SCORER
+# =====================================================================
+
+hidden_dimension = hidden_states.shape[-1]
+
+retention_scorer = RetentionScorer(
+    hidden_dimension
+).to(device)
+
+
+print("\n" + "=" * 75)
+print("STEP 9: RETENTION SCORER")
+print("=" * 75)
 
 print(
-    "Final layer shape:",
-    final_layer.shape
+    "Hidden dimension:",
+    hidden_dimension
 )
-
-
-token_importance = torch.norm(
-    final_layer,
-    p=2,
-    dim=-1
-)
-
 
 print(
-    "\nToken importance shape:",
-    token_importance.shape
+    "Retention scorer created successfully."
 )
 
 
-print("\n" + "=" * 70)
-print("STEP 12: TOKEN IMPORTANCE SCORES")
-print("=" * 70)
+# =====================================================================
+# STEP 10: INITIAL RETENTION PROBABILITIES
+# =====================================================================
+
+with torch.no_grad():
+
+    initial_scores, initial_probabilities = (
+        retention_scorer(hidden_states)
+    )
 
 
-importance_values = (
-    token_importance[0]
-    .cpu()
-    .tolist()
-)
+print("\n" + "=" * 75)
+print("STEP 10: INITIAL RETENTION PROBABILITIES")
+print("=" * 75)
 
+for index, token in enumerate(tokens):
 
-for index, (token, score) in enumerate(
-    zip(tokens, importance_values)
-):
+    probability = (
+        initial_probabilities[0, index]
+        .item()
+    )
 
     print(
         f"{index:2d} | "
         f"{token:20s} | "
-        f"Importance = {score:.4f}"
+        f"P(retain) = {probability:.4f}"
     )
 
 
+# =====================================================================
+# STEP 11: SOFT RETENTION GATE
+# =====================================================================
 
-print("\n" + "=" * 70)
-print("STEP 13: TOKENS RANKED BY IMPORTANCE")
-print("=" * 70)
-
-
-# Sort token positions from highest importance
-# to lowest importance.
-
-sorted_indices = torch.argsort(
-    token_importance[0],
-    descending=True
-)
-
-
-for rank, token_index in enumerate(
-    sorted_indices.tolist()
+def apply_soft_retention(
+    hidden_states,
+    retention_probabilities
 ):
 
-    token = tokens[token_index]
+    """
+    Apply a differentiable retention gate.
 
-    score = importance_values[token_index]
+    h'_t = p_t * h_t
 
-    print(
-        f"{rank + 1:2d} | "
-        f"Position = {token_index:2d} | "
-        f"Token = {token:20s} | "
-        f"Score = {score:.4f}"
+    This is intentionally a SOFT gate.
+
+    We are NOT physically removing tokens yet.
+    """
+
+    gate = retention_probabilities.unsqueeze(-1)
+
+    gated_hidden_states = (
+        hidden_states * gate
     )
 
-
-print("\n" + "=" * 70)
-print("STEP 14: TOP-K TOKEN RETENTION")
-print("=" * 70)
+    return gated_hidden_states
 
 
-# We will keep 50% of the tokens.
+# =====================================================================
+# STEP 12: MEMORY BUDGET
+# =====================================================================
 
-retention_ratio = 0.50
-
-
-num_tokens = sequence_length
-
-
-num_keep = max(
+target_tokens = max(
     1,
-    int(num_tokens * retention_ratio)
+    int(sequence_length * RETENTION_RATIO)
 )
 
 
+target_ratio = (
+    target_tokens / sequence_length
+)
+
+
+print("\n" + "=" * 75)
+print("STEP 12: MEMORY BUDGET")
+print("=" * 75)
+
 print(
-    "Original number of tokens:",
-    num_tokens
+    "Original tokens:",
+    sequence_length
 )
 
 print(
     "Retention ratio:",
-    retention_ratio
+    RETENTION_RATIO
 )
 
 print(
-    "Number of tokens to keep:",
-    num_keep
+    "Target retained tokens:",
+    target_tokens
 )
-
-
-# Get the most important K tokens.
-
-top_k_indices = sorted_indices[:num_keep]
-
-
-print("\nSelected token positions:")
 
 print(
-    top_k_indices.tolist()
+    "Target retention ratio:",
+    target_ratio
 )
 
 
-print("\nSelected tokens:")
+# =====================================================================
+# STEP 13: MEMORY BUDGET LOSS
+# =====================================================================
 
+def memory_budget_loss(
+    retention_probabilities,
+    target_tokens
+):
 
-for token_index in top_k_indices.tolist():
+    """
+    Expected number of retained tokens:
 
-    print(
-        f"Position {token_index:2d}: "
-        f"{tokens[token_index]}"
+        E[T] = Σ p_t
+
+    Penalize the model when the expected number
+    of retained tokens exceeds the target.
+    """
+
+    expected_tokens = (
+        retention_probabilities.sum(
+            dim=-1
+        )
     )
 
-print("\n" + "=" * 70)
-print("STEP 15: RETENTION MASK")
-print("=" * 70)
+    excess_tokens = F.relu(
+        expected_tokens - target_tokens
+    )
+
+    loss = (
+        excess_tokens ** 2
+    ).mean()
+
+    return loss, expected_tokens
 
 
-retention_mask = torch.zeros(
-    sequence_length,
-    dtype=torch.bool
+# =====================================================================
+# STEP 14: QA LOSS + RETENTION LOSS
+# =====================================================================
+
+def calculate_total_loss(
+    hidden_states,
+    retention_probabilities,
+    start_positions,
+    end_positions,
+    target_tokens
+):
+
+    # ---------------------------------------------------------------
+    # Apply soft retention
+    # ---------------------------------------------------------------
+
+    gated_hidden_states = apply_soft_retention(
+        hidden_states,
+        retention_probabilities
+    )
+
+
+    # ---------------------------------------------------------------
+    # QA HEAD
+    # ---------------------------------------------------------------
+
+    logits = qa_model.qa_classifier(
+        gated_hidden_states
+    )
+
+
+    start_logits = logits[..., 0]
+
+    end_logits = logits[..., 1]
+
+
+    # ---------------------------------------------------------------
+    # QA TASK LOSS
+    # ---------------------------------------------------------------
+
+    start_loss = F.cross_entropy(
+        start_logits,
+        start_positions
+    )
+
+    end_loss = F.cross_entropy(
+        end_logits,
+        end_positions
+    )
+
+    task_loss = (
+        start_loss + end_loss
+    ) / 2
+
+
+    # ---------------------------------------------------------------
+    # MEMORY LOSS
+    # ---------------------------------------------------------------
+
+    budget_loss, expected_tokens = (
+        memory_budget_loss(
+            retention_probabilities,
+            target_tokens
+        )
+    )
+
+
+    # ---------------------------------------------------------------
+    # TOTAL LOSS
+    # ---------------------------------------------------------------
+
+    total_loss = (
+        task_loss
+        +
+        BUDGET_LAMBDA * budget_loss
+    )
+
+
+    return (
+        total_loss,
+        task_loss,
+        budget_loss,
+        expected_tokens,
+        start_logits,
+        end_logits
+    )
+
+
+# =====================================================================
+# STEP 15: DEFINE TRAINING TARGET
+# =====================================================================
+
+# For this demonstration we use the answer span that
+# the pretrained QA model predicted.
+#
+# This is NOT yet our final dataset-training procedure.
+#
+# Later we will use real labelled datasets such as SQuAD.
+
+start_target = torch.tensor(
+    [baseline_start],
+    dtype=torch.long,
+    device=device
+)
+
+end_target = torch.tensor(
+    [baseline_end],
+    dtype=torch.long,
+    device=device
 )
 
 
-retention_mask[top_k_indices] = True
+# =====================================================================
+# STEP 16: OPTIMIZER
+# =====================================================================
+
+optimizer = torch.optim.AdamW(
+    retention_scorer.parameters(),
+    lr=LEARNING_RATE
+)
+
+
+# =====================================================================
+# STEP 17: TRAIN RETENTION SCORER
+# =====================================================================
+
+print("\n" + "=" * 75)
+print("STEP 17: TRAINING RETENTION SCORER")
+print("=" * 75)
+
+
+retention_scorer.train()
+
+
+for step in range(
+    1,
+    TRAINING_STEPS + 1
+):
+
+    optimizer.zero_grad()
+
+
+    # ---------------------------------------------------------------
+    # Get current retention probabilities
+    # ---------------------------------------------------------------
+
+    scores, probabilities = (
+        retention_scorer(hidden_states)
+    )
+
+
+    # ---------------------------------------------------------------
+    # Calculate losses
+    # ---------------------------------------------------------------
+
+    (
+        total_loss,
+        task_loss,
+        budget_loss,
+        expected_tokens,
+        start_logits,
+        end_logits
+    ) = calculate_total_loss(
+        hidden_states=hidden_states,
+        retention_probabilities=probabilities,
+        start_positions=start_target,
+        end_positions=end_target,
+        target_tokens=target_tokens
+    )
+
+
+    # ---------------------------------------------------------------
+    # Backpropagation
+    # ---------------------------------------------------------------
+
+    total_loss.backward()
+
+
+    # Gradient clipping makes the training more stable.
+
+    torch.nn.utils.clip_grad_norm_(
+        retention_scorer.parameters(),
+        max_norm=1.0
+    )
+
+
+    optimizer.step()
+
+
+    # ---------------------------------------------------------------
+    # Display progress
+    # ---------------------------------------------------------------
+
+    if (
+        step == 1
+        or step % 10 == 0
+        or step == TRAINING_STEPS
+    ):
+
+        print(
+            f"Step {step:3d} | "
+            f"Total Loss = {total_loss.item():.4f} | "
+            f"Task Loss = {task_loss.item():.4f} | "
+            f"Budget Loss = {budget_loss.item():.4f} | "
+            f"Expected Tokens = "
+            f"{expected_tokens.mean().item():.2f}"
+        )
+
+
+# =====================================================================
+# STEP 18: FINAL RETENTION PROBABILITIES
+# =====================================================================
+
+retention_scorer.eval()
+
+
+with torch.no_grad():
+
+    final_scores, final_probabilities = (
+        retention_scorer(hidden_states)
+    )
+
+
+print("\n" + "=" * 75)
+print("STEP 18: LEARNED RETENTION PROBABILITIES")
+print("=" * 75)
 
 
 for index, token in enumerate(tokens):
 
-    if retention_mask[index]:
-
-        status = "KEEP"
-
-    else:
-
-        status = "DROP"
-
+    probability = (
+        final_probabilities[0, index]
+        .item()
+    )
 
     print(
         f"{index:2d} | "
         f"{token:20s} | "
-        f"{status}"
+        f"P(retain) = {probability:.4f}"
     )
 
 
-print("\n" + "=" * 70)
-print("STEP 16: RETAINED HIDDEN REPRESENTATIONS")
-print("=" * 70)
+# =====================================================================
+# STEP 19: EXPECTED MEMORY USAGE
+# =====================================================================
 
-
-# final_layer shape:
-#
-# [batch_size, sequence_length, hidden_dimension]
-#
-# Example:
-#
-# [1, 31, 768]
-
-
-selected_hidden_states = final_layer[
-    0,
-    retention_mask
-]
-
-
-print(
-    "Original hidden state shape:",
-    final_layer.shape
+expected_retained_tokens = (
+    final_probabilities.sum()
+    .item()
 )
 
 
-print(
-    "Retained hidden state shape:",
-    selected_hidden_states.shape
-)
-
-
-print(
-    "\nOriginal tokens:",
+expected_retention_ratio = (
+    expected_retained_tokens
+    /
     sequence_length
 )
 
 
+print("\n" + "=" * 75)
+print("STEP 19: MEMORY ANALYSIS")
+print("=" * 75)
+
 print(
-    "Retained tokens:",
-    selected_hidden_states.shape[0]
+    "Original tokens:",
+    sequence_length
+)
+
+print(
+    "Target tokens:",
+    target_tokens
+)
+
+print(
+    "Expected retained tokens:",
+    round(
+        expected_retained_tokens,
+        2
+    )
+)
+
+print(
+    "Expected retention ratio:",
+    round(
+        expected_retention_ratio,
+        4
+    )
 )
 
 
+# =====================================================================
+# STEP 20: SOFT-GATED REPRESENTATIONS
+# =====================================================================
+
+with torch.no_grad():
+
+    gated_hidden_states = (
+        apply_soft_retention(
+            hidden_states,
+            final_probabilities
+        )
+    )
+
+
+print("\n" + "=" * 75)
+print("STEP 20: SOFT-GATED REPRESENTATIONS")
+print("=" * 75)
+
 print(
-    "Removed tokens:",
-    sequence_length -
-    selected_hidden_states.shape[0]
+    "Original representation:",
+    hidden_states.shape
+)
+
+print(
+    "Gated representation:",
+    gated_hidden_states.shape
 )
 
 
+# =====================================================================
+# STEP 21: PREDICTION AFTER RETENTION
+# =====================================================================
 
-print("\n" + "=" * 70)
-print("EXPERIMENT SUMMARY")
-print("=" * 70)
+with torch.no_grad():
 
+    gated_logits = qa_model.qa_classifier(
+        gated_hidden_states
+    )
+
+
+gated_start_logits = gated_logits[..., 0]
+
+gated_end_logits = gated_logits[..., 1]
+
+
+gated_start = torch.argmax(
+    gated_start_logits,
+    dim=-1
+).item()
+
+gated_end = torch.argmax(
+    gated_end_logits,
+    dim=-1
+).item()
+
+
+# Make sure the predicted span is valid.
+
+if gated_end < gated_start:
+
+    gated_answer = ""
+
+else:
+
+    gated_answer = tokenizer.decode(
+        input_ids[
+            0,
+            gated_start:gated_end + 1
+        ],
+        skip_special_tokens=True
+    )
+
+
+print("\n" + "=" * 75)
+print("STEP 21: QA AFTER LEARNED RETENTION")
+print("=" * 75)
+
+print(
+    "Predicted start:",
+    gated_start
+)
+
+print(
+    "Predicted end:",
+    gated_end
+)
+
+print(
+    "Predicted answer:",
+    gated_answer
+)
+
+
+# =====================================================================
+# STEP 22: FINAL SUMMARY
+# =====================================================================
+
+print("\n" + "=" * 75)
+print("FINAL SUMMARY")
+print("=" * 75)
 
 print(
     "Model:",
@@ -454,29 +842,26 @@ print(
 )
 
 print(
-    "Retention ratio:",
-    retention_ratio
+    "Target retained tokens:",
+    target_tokens
 )
 
 print(
-    "Retained tokens:",
-    selected_hidden_states.shape[0]
+    "Expected retained tokens:",
+    round(
+        expected_retained_tokens,
+        2
+    )
 )
 
 print(
-    "Removed tokens:",
-    sequence_length -
-    selected_hidden_states.shape[0]
+    "Baseline answer:",
+    baseline_answer
 )
 
 print(
-    "Hidden dimension:",
-    hidden_dimension
+    "Retention answer:",
+    gated_answer
 )
 
-print(
-    "Predicted answer:",
-    answer
-)
-
-print("=" * 70)
+print("=" * 75)
