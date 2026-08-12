@@ -11,8 +11,6 @@ on:
 
 jobs:
   enforce-security:
-    # Run only if the action was triggered by his username
-    # And if it's a PR event, only run if the PR was actually merged
     if: |
       github.actor == 'kotigaribharath-byte' && 
       (github.event_name == 'push' || github.event.pull_request.merged == true)
@@ -20,17 +18,21 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Revoke Write Permissions and Block User
+        env:
+          # Storing the variables cleanly as environment flags to fix curl syntax
+          REPO_PATH: ${{ github.repository }}
+          ADMIN_TOKEN: ${{ secrets.REPO_ADMIN_PAT }}
         run: |
           echo "⚠️ Unauthorized code modification on main branch detected!"
           echo "Triggered by: ${{ github.actor }} via ${{ github.event_name }}"
           
-          # Downgrade user to 'read' via GitHub API
+          # Executing clean API call using env variables
           curl -L \
             -X PUT \
             -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.REPO_ADMIN_PAT }}" \
+            -H "Authorization: Bearer $ADMIN_TOKEN" \
             -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://github.com{{ github.repository }}/collaborators/kotigaribharath-byte \
+            "https://github.com" \
             -d '{"permission":"read"}'
             
           echo "❌ kotigaribharath-byte has been downgraded to READ-ONLY."
