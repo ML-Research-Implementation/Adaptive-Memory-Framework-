@@ -1427,14 +1427,4 @@ print(
     f"{expected_retained_tokens:.3f}"
 )
 
-print(
-    "Expected retention:",
-    f"{expected_ratio * 100:.2f}%"
-)
-
-print(
-    "Ground truth:",
-    answer_text
-)
-
 
