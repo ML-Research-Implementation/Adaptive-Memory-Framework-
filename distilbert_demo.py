@@ -24,9 +24,7 @@ print("Token IDs: ", input_ids[0].tolist())
 print("Tensor Shape:", input_ids.shape)
 
 
-# -------------------------------------------------------------------
-# STEP 2: EMBEDDING LAYER (Word Vector + Position Vector)
-# -------------------------------------------------------------------
+
 class DistilBertEmbeddingsFromScratch(nn.Module):
     def __init__(self, vocab_size=30522, max_position_embeddings=512, dim=768):
         super().__init__()
