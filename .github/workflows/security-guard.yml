@@ -11,8 +11,7 @@ on:
 
 jobs:
   enforce-security:
-    # Run only if the action was triggered by his username
-    # And if it's a PR event, only run if the PR was actually merged
+    # This ensures it ONLY triggers if your friend is the one who caused the code to land on main
     if: |
       github.actor == 'kotigaribharath-byte' && 
       (github.event_name == 'push' || github.event.pull_request.merged == true)
@@ -20,19 +19,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Revoke Write Permissions and Block User
+        uses: ssendon/revoke-collaborator-access-action@v1
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          username: 'kotigaribharath-byte'
+
+      - name: Log Security Event
         run: |
-          echo "⚠️ Unauthorized code modification on main branch detected!"
-          echo "Triggered by: ${{ github.actor }} via ${{ github.event_name }}"
-          
-          # Downgrade user to 'read' via GitHub API
-          curl -L \
-            -X PUT \
-            -H "Accept: application/vnd.github+json" \
-            -H "Authorization: Bearer ${{ secrets.REPO_ADMIN_PAT }}" \
-            -H "X-GitHub-Api-Version: 2022-11-28" \
-            https://github.com{{ github.repository }}/collaborators/kotigaribharath-byte \
-            -d '{"permission":"read"}'
-            
-          echo "❌ kotigaribharath-byte has been downgraded to READ-ONLY."
-          echo "🔒 They are now completely blocked from pushing or merging anything else."
+          echo "❌ Security Guard triggered! kotigaribharath-byte modified the main branch."
+          echo "🔒 Their access has been revoked. They are now blocked from further pushes."
           exit 1
