@@ -8,10 +8,7 @@ from transformers import (
 )
 
 
-# =====================================================================
-# CONFIGURATION
-# =====================================================================
-
+ 
 MODEL_NAME = "distilbert-base-uncased-distilled-squad"
 
 RETENTION_RATIO = 0.50
@@ -27,9 +24,7 @@ device = torch.device(
 )
 
 
-# =====================================================================
-# STEP 1: DEVICE
-# =====================================================================
+ 
 
 print("=" * 75)
 print("STEP 1: DEVICE")
@@ -38,18 +33,14 @@ print("=" * 75)
 print("Device:", device)
 
 
-# =====================================================================
-# STEP 2: LOAD TOKENIZER
-# =====================================================================
+ 
 
 tokenizer = AutoTokenizer.from_pretrained(
     MODEL_NAME
 )
 
 
-# =====================================================================
-# STEP 3: LOAD PRETRAINED DISTILBERT QA MODEL
-# =====================================================================
+ 
 
 qa_model = DistilBertForQuestionAnswering.from_pretrained(
     MODEL_NAME
@@ -60,11 +51,7 @@ qa_model = qa_model.to(device)
 qa_model.eval()
 
 
-# Freeze DistilBERT for this experiment.
-#
-# We are currently studying the retention mechanism itself.
-# Later, we can jointly fine-tune the model and retention module.
-
+ 
 for parameter in qa_model.parameters():
     parameter.requires_grad = False
 
@@ -72,9 +59,7 @@ for parameter in qa_model.parameters():
 encoder = qa_model.distilbert
 
 
-# =====================================================================
-# STEP 4: QUESTION + CONTEXT
-# =====================================================================
+ 
 
 question = "What is artificial intelligence?"
 
@@ -85,9 +70,7 @@ tasks that normally require human intelligence.
 """
 
 
-# =====================================================================
-# STEP 5: TOKENIZATION
-# =====================================================================
+ 
 
 inputs = tokenizer(
     question,
@@ -126,9 +109,7 @@ print("\nInput shape:")
 print(input_ids.shape)
 
 
-# =====================================================================
-# STEP 6: DISTILBERT ENCODER
-# =====================================================================
+ 
 
 with torch.no_grad():
 
@@ -168,9 +149,7 @@ for layer_index, layer_hidden in enumerate(
     )
 
 
-# =====================================================================
-# STEP 7: BASELINE QA PREDICTION
-# =====================================================================
+ 
 
 with torch.no_grad():
 
@@ -219,30 +198,13 @@ print("End index:", baseline_end)
 print("Answer:", baseline_answer)
 
 
-# =====================================================================
-# STEP 8: MANUAL GROUND-TRUTH ANSWER SPAN
-# =====================================================================
-#
-# Our context contains:
-#
-# "Artificial intelligence is a field of computer science..."
-#
-# The answer is:
-#
-# "a field of computer science"
-#
-# We locate this span using character offsets and tokenizer offsets.
-#
-# This is much better than using the model's own prediction as the
-# training target.
-# =====================================================================
+ 
 
 
 answer_text = "a field of computer science"
 
 
-# Tokenizer with offset mapping
-
+ 
 offset_inputs = tokenizer(
     question,
     context,
@@ -256,7 +218,7 @@ offset_mapping = offset_inputs[
 ][0]
 
 
-# Find answer inside the context.
+ 
 
 answer_start_char = context.find(
     answer_text
@@ -276,10 +238,7 @@ answer_end_char = (
 )
 
 
-# The question and context are separated by special tokens.
-# Offset mappings allow us to identify which tokens belong to
-# the answer span.
-
+ 
 answer_token_positions = []
 
 for index, (start, end) in enumerate(
@@ -348,11 +307,7 @@ end_target = torch.tensor(
 )
 
 
-# =====================================================================
-# STEP 9: RETENTION SCORER
-# =====================================================================
-
-class RetentionScorer(nn.Module):
+ 
 
     """
     Learnable token-retention scorer.
@@ -407,9 +362,7 @@ class RetentionScorer(nn.Module):
         return scores, probabilities
 
 
-# =====================================================================
-# STEP 10: CREATE RETENTION SCORER
-# =====================================================================
+ 
 
 hidden_dimension = hidden_states.shape[-1]
 
@@ -427,9 +380,7 @@ print(
 )
 
 
-# =====================================================================
-# STEP 11: MEMORY BUDGET
-# =====================================================================
+ 
 
 target_tokens = max(
     1,
@@ -457,26 +408,20 @@ print(
 )
 
 
-# =====================================================================
-# STEP 12: MEMORY BUDGET LOSS
-# =====================================================================
-
+ 
 def calculate_budget_loss(
     probabilities,
     target_tokens
 ):
 
-    # Expected number of retained tokens:
-    #
-    # E[T] = Σ p_t
+     
 
     expected_tokens = probabilities.sum(
         dim=-1
     )
 
 
-    # Penalize only when we exceed the budget.
-
+    
     excess = F.relu(
         expected_tokens - target_tokens
     )
@@ -493,9 +438,7 @@ def calculate_budget_loss(
     )
 
 
-# =====================================================================
-# STEP 13: APPLY SOFT RETENTION
-# =====================================================================
+ 
 
 def apply_soft_gate(
     hidden_states,
@@ -513,23 +456,14 @@ def apply_soft_gate(
     return gated_hidden_states
 
 
-# =====================================================================
-# STEP 14: QA LOSS
-# =====================================================================
-
+ 
 def calculate_task_loss(
     gated_hidden_states,
     start_target,
     end_target
 ):
 
-    # DistilBERT QA head:
-    #
-    # hidden state [768]
-    #        ↓
-    # linear layer
-    #        ↓
-    # start/end logits
+    
 
     logits = qa_model.qa_classifier(
         gated_hidden_states
@@ -565,19 +499,14 @@ def calculate_task_loss(
     )
 
 
-# =====================================================================
-# STEP 15: OPTIMIZER
-# =====================================================================
-
+ 
 optimizer = torch.optim.AdamW(
     retention_scorer.parameters(),
     lr=LEARNING_RATE
 )
 
 
-# =====================================================================
-# STEP 16: INITIAL PROBABILITIES
-# =====================================================================
+ 
 
 retention_scorer.eval()
 
@@ -608,10 +537,7 @@ for index, token in enumerate(tokens):
     )
 
 
-# =====================================================================
-# STEP 17: TRAIN RETENTION SCORER
-# =====================================================================
-
+ 
 print("\n" + "=" * 75)
 print("STEP 17: TRAINING")
 print("=" * 75)
@@ -628,10 +554,7 @@ for step in range(
     optimizer.zero_grad()
 
 
-    # ---------------------------------------------------------------
-    # Get learned retention probabilities
-    # ---------------------------------------------------------------
-
+    
     scores, probabilities = (
         retention_scorer(
             hidden_states
@@ -639,9 +562,7 @@ for step in range(
     )
 
 
-    # ---------------------------------------------------------------
-    # Apply soft retention
-    # ---------------------------------------------------------------
+     
 
     gated_hidden_states = (
         apply_soft_gate(
@@ -651,10 +572,7 @@ for step in range(
     )
 
 
-    # ---------------------------------------------------------------
-    # Task loss
-    # ---------------------------------------------------------------
-
+    
     (
         task_loss,
         start_logits,
@@ -666,9 +584,7 @@ for step in range(
     )
 
 
-    # ---------------------------------------------------------------
-    # Memory loss
-    # ---------------------------------------------------------------
+ 
 
     (
         budget_loss,
@@ -679,9 +595,7 @@ for step in range(
     )
 
 
-    # ---------------------------------------------------------------
-    # Total loss
-    # ---------------------------------------------------------------
+    
 
     total_loss = (
         task_loss
@@ -690,14 +604,12 @@ for step in range(
     )
 
 
-    # ---------------------------------------------------------------
-    # Backpropagation
-    # ---------------------------------------------------------------
+     
 
     total_loss.backward()
 
 
-    # Prevent unstable gradients.
+    
 
     torch.nn.utils.clip_grad_norm_(
         retention_scorer.parameters(),
@@ -708,10 +620,7 @@ for step in range(
     optimizer.step()
 
 
-    # ---------------------------------------------------------------
-    # Print progress
-    # ---------------------------------------------------------------
-
+    
     if (
         step == 1
         or step % 20 == 0
@@ -728,9 +637,7 @@ for step in range(
         )
 
 
-# =====================================================================
-# STEP 18: FINAL RETENTION PROBABILITIES
-# =====================================================================
+ 
 
 retention_scorer.eval()
 
@@ -790,9 +697,7 @@ for rank, index in enumerate(
     )
 
 
-# =====================================================================
-# STEP 20: EXPECTED MEMORY
-# =====================================================================
+ 
 
 with torch.no_grad():
 
@@ -840,15 +745,7 @@ print(
 )
 
 
-# =====================================================================
-# STEP 21: BINARY INTERPRETATION
-# =====================================================================
-#
-# This is only an interpretation of the learned probabilities.
-#
-# It is NOT yet Bernoulli sampling or Hard-Concrete.
-#
-
+ 
 
 threshold = 0.50
 
@@ -901,10 +798,7 @@ for index, token in enumerate(tokens):
     )
 
 
-# =====================================================================
-# STEP 22: SOFT-GATED QA PREDICTION
-# =====================================================================
-
+ 
 with torch.no_grad():
 
     gated_hidden_states = (
@@ -983,10 +877,7 @@ print(
 )
 
 
-# =====================================================================
-# STEP 23: FINAL SUMMARY
-# =====================================================================
-
+ 
 print("\n" + "=" * 75)
 print("FINAL SUMMARY")
 print("=" * 75)
