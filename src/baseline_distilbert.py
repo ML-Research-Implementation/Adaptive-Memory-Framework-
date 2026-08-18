@@ -1,4 +1,4 @@
- import torch
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -309,23 +309,8 @@ end_target = torch.tensor(
 
  
 
-    """
-    Learnable token-retention scorer.
 
-    Input:
-
-        h_t ∈ R^768
-
-    Output:
-
-        s_t ∈ R
-
-    Then:
-
-        p_t = sigmoid(s_t)
-
-    where p_t is the learned retention probability.
-    """
+class RetentionScorer(nn.Module):
 
     def __init__(self, hidden_dimension):
 
@@ -345,7 +330,6 @@ end_target = torch.tensor(
                 1
             )
         )
-
 
     def forward(self, hidden_states):
 
@@ -582,7 +566,6 @@ for step in range(
         start_target,
         end_target
     )
-
 
  
 

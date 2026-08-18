@@ -1,5 +1,9 @@
 # AMMR — Adaptive Multi-Level Memory Retention for Efficient Transformer Networks
 
+## Current Status: ✅ IMPLEMENTATION COMPLETE & TESTABLE
+
+The core framework is **fully implemented, modularized, and ready for testing**. See [Testing](#testing) and [Implementation Summary](#implementation-summary) sections below.
+
 ## 1. Project Overview
 
 **AMMR (Adaptive Multi-Level Memory Retention)** is a research project focused on reducing the memory and computational requirements of Transformer networks while preserving important contextual information.
@@ -26,7 +30,325 @@ The exact number of levels and their operations will be determined through exper
 
 ---
 
-# 2. Research Problem
+# Testing
+
+## Quick Start Testing
+
+### 1. Test Complete Pipeline
+```bash
+cd d:\Adaptive-Memory-Framework-
+python main.py
+```
+
+**Expected Output:**
+- ✅ Device detection (CPU/CUDA)
+- ✅ Model loading and parameter counting
+- ✅ Tokenization of question-context pair
+- ✅ Answer span localization
+- ✅ Baseline QA prediction
+- ✅ Hidden state extraction (6 DistilBERT layers)
+- ✅ Retention scorer training (500 steps)
+- ✅ Final retention probabilities
+- ✅ Comparison of baseline vs. retained predictions
+
+**Runtime:** ~2-5 minutes (depending on hardware)
+
+### 2. Test Module Examples
+```bash
+python examples.py
+```
+
+**Expected Output:**
+- ✅ Basic setup with model loading
+- ✅ Tokenization and encoding
+- ✅ Hidden state extraction
+
+### 3. Individual Module Testing
+
+#### Test Configuration
+```python
+from config import DEVICE, LEARNING_RATE, RETENTION_RATIO
+print(f"Device: {DEVICE}")
+print(f"Learning Rate: {LEARNING_RATE}")
+print(f"Retention Ratio: {RETENTION_RATIO}")
+```
+
+#### Test Data Module
+```python
+from src import QADataLoader, find_answer_span
+
+loader = QADataLoader()
+question = "What is AI?"
+context = "AI is artificial intelligence."
+
+# Test tokenization
+encoded = loader.tokenize_qa(question, context)
+print(f"Input IDs shape: {encoded['input_ids'].shape}")
+
+# Test offset mapping for answer location
+encoded_with_offsets = loader.tokenize_qa_with_offsets(question, context)
+tokens = loader.get_tokens(encoded_with_offsets['input_ids'])
+print(f"Tokens: {tokens}")
+```
+
+#### Test Baseline Model
+```python
+from src import BaselineQAModel
+from config import DEVICE
+
+baseline = BaselineQAModel(freeze_parameters=True)
+print(f"Model parameters: {baseline.num_parameters:,}")
+
+# Test baseline prediction
+start, end, _, info = baseline.get_baseline_prediction(
+    encoded['input_ids'], 
+    encoded['attention_mask']
+)
+print(f"Predicted span: {start} to {end}")
+```
+
+#### Test Retention Scorer
+```python
+from src import RetentionScorer
+import torch
+
+scorer = RetentionScorer(hidden_dimension=768)
+dummy_hidden = torch.randn(1, 31, 768)  # batch=1, seq_len=31, hidden=768
+
+scores, probabilities = scorer(dummy_hidden)
+print(f"Scores shape: {scores.shape}")
+print(f"Probabilities shape: {probabilities.shape}")
+print(f"Probability range: [{probabilities.min():.4f}, {probabilities.max():.4f}]")
+```
+
+#### Test Loss Functions
+```python
+from src import (
+    calculate_qa_loss,
+    calculate_budget_loss,
+    calculate_entropy_loss,
+    calculate_combined_loss
+)
+import torch
+
+# Create dummy data
+gated_hidden = torch.randn(1, 31, 768)
+start_target = torch.tensor([5])
+end_target = torch.tensor([8])
+probabilities = torch.sigmoid(torch.randn(1, 31))
+valid_mask = torch.ones(31, dtype=torch.bool)
+target_budget = 15
+
+# Test individual losses
+qa_loss, _, _ = calculate_qa_loss(baseline.qa_model, gated_hidden, start_target, end_target)
+budget_loss, expected = calculate_budget_loss(probabilities, valid_mask, target_budget)
+entropy_loss = calculate_entropy_loss(probabilities, valid_mask)
+
+print(f"QA Loss: {qa_loss.item():.6f}")
+print(f"Budget Loss: {budget_loss.item():.6f}")
+print(f"Entropy Loss: {entropy_loss.item():.6f}")
+
+# Test combined loss
+total_loss, loss_dict = calculate_combined_loss(qa_loss, budget_loss, entropy_loss)
+print(f"Total Loss: {total_loss.item():.6f}")
+```
+
+#### Test Training
+```python
+from src import train_retention_scorer
+
+trainer, result = train_retention_scorer(
+    scorer=scorer,
+    qa_model=baseline.qa_model,
+    hidden_states=hidden_states,
+    protected_mask=protected_mask,
+    valid_mask=valid_mask,
+    start_target=start_target,
+    end_target=end_target,
+    target_budget=target_budget,
+    num_steps=100,  # Quick test with fewer steps
+    verbose=True
+)
+
+print(f"Final loss: {result['total']:.6f}")
+print(f"Expected retained tokens: {result['expected_tokens']:.1f}")
+```
+
+#### Test Evaluation & Analysis
+```python
+from src import RetentionAnalyzer
+
+analyzer = RetentionAnalyzer(tokens, probabilities, protected_mask, valid_mask)
+
+# Print summary
+analyzer.print_summary()
+
+# Get rankings
+ranking = analyzer.get_token_ranking()
+print(f"\nTop 5 important tokens:")
+for rank, (idx, token, prob, type_) in enumerate(ranking[:5], 1):
+    print(f"{rank}. {token}: {prob:.4f} ({type_})")
+
+# Get statistics
+expected_retained = analyzer.get_expected_retained_tokens()
+retention_ratio = analyzer.get_retention_ratio()
+print(f"\nExpected retained: {expected_retained:.1f} tokens")
+print(f"Retention ratio: {retention_ratio:.2%}")
+```
+
+---
+
+# Implementation Summary
+
+## ✅ What Has Been Implemented
+
+### Core Architecture
+- ✅ **Modular Framework** - 10 focused modules with clear responsibilities
+- ✅ **Centralized Configuration** - All hyperparameters in `config.py`
+- ✅ **Clean Imports** - Unified exports through `src/__init__.py`
+
+### Data Handling (`src/data.py`)
+- ✅ QADataLoader class for tokenization
+- ✅ Answer span localization using offsets
+- ✅ Token type classification (special/question/context)
+- ✅ Token mask creation (protected/valid/ignored)
+
+### Models (`src/models.py`)
+- ✅ **RetentionScorer** - Learnable MLP for token importance scoring
+  - Architecture: Linear → LayerNorm → GELU → Dropout → Linear
+  - Output: Sigmoid-scaled retention probabilities
+- ✅ **SoftRetentionGate** - Probabilistic gating module
+  - Soft multiplication: h'_t = p_t * h_t (differentiable)
+- ✅ **AdaptiveMemoryRetention** - Complete retention module
+
+### Loss Functions (`src/losses.py`)
+- ✅ **QA Loss** - Cross-entropy for answer span prediction
+- ✅ **Budget Loss** - Constrains token retention to budget
+- ✅ **Entropy Loss** - Encourages sharp retention decisions
+- ✅ **Combined Loss** - Multi-objective optimization
+
+### Training (`src/training.py`)
+- ✅ **RetentionScorerTrainer** - Training manager
+  - Step-wise training with logging
+  - Gradient clipping and checkpointing
+  - Loss history tracking
+- ✅ **train_retention_scorer()** - Simple training interface
+
+### Evaluation (`src/evaluation.py`)
+- ✅ **RetentionAnalyzer** - Token importance analysis
+  - Ranking by retention probability
+  - Memory statistics and expected retained tokens
+  - Token type classification
+- ✅ **Metrics Computation** - EM, F1, Precision, Recall
+- ✅ **Prediction Comparison** - Baseline vs. retained
+
+### Utilities (`src/utils.py`)
+- ✅ Reproducibility (seed management)
+- ✅ Device management (CPU/CUDA)
+- ✅ Parameter counting (total and trainable)
+- ✅ Model freezing/unfreezing
+- ✅ Checkpointing (save/load)
+- ✅ Logging with formatted headers
+
+### Baseline Model (`src/baseline.py`)
+- ✅ **BaselineQAModel** - DistilBERT QA wrapper
+  - Model loading and parameter freezing
+  - Hidden state extraction (all 6 layers)
+  - QA head predictions
+  - Baseline metrics computation
+
+### Complete Pipelines
+- ✅ **main.py** - Full working pipeline (350 lines)
+  - Load baseline → Prepare data → Extract hidden states → Train scorer → Analyze retention
+- ✅ **examples.py** - Simple usage demonstrations
+
+### Documentation
+- ✅ **README_MODULAR.md** - Complete architecture guide
+- ✅ **QUICKREF.md** - Quick lookup and patterns
+- ✅ **REFACTORING_GUIDE.md** - Migration from monolithic code
+- ✅ **PROJECT_STRUCTURE.md** - Simple overview
+- ✅ **Comprehensive docstrings** - Every class and function documented
+
+## Current Capabilities
+
+### ✅ Baseline Setup
+- Load pre-trained DistilBERT (distilbert-base-uncased-distilled-squad)
+- Freeze model parameters for controlled experiments
+- Extract hidden representations (all 6 layers)
+
+### ✅ Data Processing
+- Tokenize question-context pairs
+- Locate answer spans using character offsets
+- Create proper token masks (protected/adaptive/ignored)
+- Support for special tokens ([CLS], [SEP])
+
+### ✅ Retention Mechanism
+- Learn task-specific token importance
+- Soft probabilistic gating (differentiable)
+- Protect important structural tokens
+- Budget-constrained retention (target # of tokens)
+
+### ✅ Training
+- Multi-objective loss (QA + budget + entropy)
+- Configurable loss weights
+- Gradient clipping and adaptive learning
+- Training history tracking
+
+### ✅ Analysis
+- Token importance ranking
+- Memory usage estimation
+- Retention probability statistics
+- Baseline comparison metrics
+
+## 📊 Single Example Pipeline
+
+The framework demonstrates end-to-end functionality with a single QA example:
+
+**Question:** "What is artificial intelligence?"
+**Context:** "Artificial intelligence is a field of computer science..."
+**Answer:** "a field of computer science"
+
+**Pipeline Steps:**
+1. **Tokenization** → 31 tokens
+2. **Baseline Prediction** → Correct answer identification
+3. **Hidden State Extraction** → (31, 768) from DistilBERT
+4. **Scorer Training** → 500 steps of multi-objective optimization
+5. **Retention Analysis** → Learn which tokens are important
+6. **Comparison** → Baseline vs. retained predictions
+
+## ⏳ NOT YET Implemented
+
+These features are planned for future development:
+
+- ❌ **Actual Token Pruning** - Currently soft gating only (post-processing)
+- ❌ **Layer-wise Retention** - Prune tokens between transformer layers
+- ❌ **Batch Processing** - Only single example for now
+- ❌ **Dataset Training** - SQuAD or other full datasets
+- ❌ **Stochastic Token Pruning** - Hard decisions during forward pass
+- ❌ **Efficiency Benchmarking** - Computational savings (not yet measured)
+- ❌ **Fine-tuning** - Currently baseline is frozen
+
+## 🚀 How to Extend
+
+### Add a New Loss Function
+1. Implement in `src/losses.py`
+2. Export in `src/__init__.py`
+3. Add weight to `config.py`
+4. Use in `src/training.py`
+
+### Add a New Metric
+1. Implement in `src/evaluation.py`
+2. Export in `src/__init__.py`
+3. Compute in your script
+
+### Add a New Model Component
+1. Create class in `src/models.py`
+2. Export in `src/__init__.py`
+3. Use in `main.py` or custom scripts
+
+---
+
+
 
 Long input sequences create substantial memory and computational requirements for Transformer models.
 
