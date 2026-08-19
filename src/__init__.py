@@ -25,6 +25,18 @@ from src.models import (
     SoftRetentionGate,
     AdaptiveMemoryRetention,
 )
+from src.models_adaptive import (
+    AdaptiveDistilBertQA,
+    AdaptiveQAInference,
+    TokenSelector,
+    TokenSelectionResult,
+)
+from src.metrics import (
+    LayerWiseMetrics,
+    LayerMetrics,
+    SequenceMetrics,
+    InferenceTimer,
+)
 from src.losses import (
     calculate_qa_loss,
     calculate_budget_loss,
@@ -75,6 +87,16 @@ __all__ = [
     'RetentionScorer',
     'SoftRetentionGate',
     'AdaptiveMemoryRetention',
+    # Adaptive Models (Layer-wise Retention)
+    'AdaptiveDistilBertQA',
+    'AdaptiveQAInference',
+    'TokenSelector',
+    'TokenSelectionResult',
+    # Metrics
+    'LayerWiseMetrics',
+    'LayerMetrics',
+    'SequenceMetrics',
+    'InferenceTimer',
     # Losses
     'calculate_qa_loss',
     'calculate_budget_loss',
