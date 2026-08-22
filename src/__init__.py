@@ -20,6 +20,10 @@ from src.data import (
     get_token_type,
     create_token_masks,
 )
+from src.squad_data import (
+    SQuADDataset,
+    get_squad_dataloaders,
+)
 from src.models import (
     RetentionScorer,
     SoftRetentionGate,
@@ -57,6 +61,7 @@ from src.evaluation import (
     compare_predictions,
     print_evaluation_report,
 )
+from src.training_layerwise import LayerwiseAdaptiveTrainer
 
 __all__ = [
     # Config
@@ -83,6 +88,8 @@ __all__ = [
     'find_answer_span',
     'get_token_type',
     'create_token_masks',
+    'SQuADDataset',
+    'get_squad_dataloaders',
     # Models
     'RetentionScorer',
     'SoftRetentionGate',
@@ -108,6 +115,7 @@ __all__ = [
     # Training
     'RetentionScorerTrainer',
     'train_retention_scorer',
+    'LayerwiseAdaptiveTrainer',
     # Evaluation
     'RetentionAnalyzer',
     'get_top_k_tokens',

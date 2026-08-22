@@ -98,79 +98,45 @@ class TokenSelector:
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
-        # For now, assume batch_size = 1 (single example)
-        assert batch_size == 1, "Batch processing not yet supported"
+        # Calculate target number of tokens to select K (common across the batch)
+        K = max(self.min_tokens_to_keep, int(seq_len * retention_ratio))
+        K = min(K, seq_len)
         
-        # Get original sequence
-        hidden_states_sq = hidden_states[0]  # (seq_len, hidden_dim)
-        probs_sq = retention_probs[0]  # (seq_len,)
-        scores_sq = retention_scores[0]  # (seq_len,)
-        attention_sq = attention_mask[0]  # (seq_len,)
+        # Create a modified scores tensor for selection
+        scores_adaptive = retention_scores.clone()
         
-        # Count valid (non-padding) tokens
-        valid_mask = attention_sq > 0.5  # (seq_len,)
-        num_valid = valid_mask.sum().item()
+        # Push padding tokens to -inf so they are dropped
+        padding_mask = attention_mask < 0.5
+        scores_adaptive.masked_fill_(padding_mask, float('-inf'))
         
-        # Count protected tokens
+        # Push protected tokens to +inf so they are always selected
         protected_mask_device = protected_mask.to(self.device)
-        num_protected = protected_mask_device.sum().item()
+        scores_adaptive.masked_fill_(protected_mask_device, float('inf'))
         
-        # Calculate target number of tokens to select
-        target_count = max(
-            self.min_tokens_to_keep,
-            int(num_valid * retention_ratio)
-        )
+        # Select Top-K indices for the batch
+        # top_indices will be shape (batch_size, K)
+        _, top_indices = torch.topk(scores_adaptive, k=K, dim=1)
         
-        # Ensure we don't select more than available
-        target_count = min(target_count, num_valid)
+        # Sort indices to preserve temporal order
+        top_indices, _ = torch.sort(top_indices, dim=1)
         
-        # Number of tokens to select from non-protected set
-        tokens_to_select_from_adaptive = target_count - num_protected
-        tokens_to_select_from_adaptive = max(0, tokens_to_select_from_adaptive)
+        # Apply soft gate before extraction to enable gradient flow to probabilities
+        gated_hidden = hidden_states * retention_probs.unsqueeze(-1)
         
-        # Create selection mask
-        selection_mask = torch.zeros(seq_len, dtype=torch.bool, device=self.device)
+        # Gather selected hidden states
+        expanded_indices = top_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+        selected_hidden_states = torch.gather(gated_hidden, 1, expanded_indices)  # (batch, K, hidden)
         
-        # Always select protected tokens
-        selection_mask = selection_mask | protected_mask_device
-        
-        # Select top-K from non-protected, valid tokens
-        non_protected_valid = (~protected_mask_device) & valid_mask
-        
-        if tokens_to_select_from_adaptive > 0 and non_protected_valid.sum() > 0:
-            # Get scores for non-protected valid tokens
-            scores_adaptive = scores_sq.clone()
-            scores_adaptive[~non_protected_valid] = float('-inf')
-            
-            # Select top-k
-            _, top_indices = torch.topk(
-                scores_adaptive,
-                k=min(tokens_to_select_from_adaptive, non_protected_valid.sum().item()),
-                dim=0
-            )
-            selection_mask[top_indices] = True
-        
-        # Get selected indices and hidden states
-        selected_indices = torch.where(selection_mask)[0]  # (num_selected,)
-        selected_hidden_states = hidden_states_sq[selected_indices]  # (num_selected, hidden_dim)
-        
-        # Create new attention mask for selected tokens
-        new_attention_mask = torch.ones(
-            1,
-            len(selected_indices),
-            dtype=attention_mask.dtype,
-            device=self.device
-        )
-        
-        num_selected = len(selected_indices)
+        # Create new attention mask
+        new_attention_mask = torch.gather(attention_mask, 1, top_indices)
         
         return TokenSelectionResult(
-            selected_indices=selected_indices,
-            selected_hidden_states=selected_hidden_states.unsqueeze(0),  # (1, num_selected, hidden_dim)
-            new_attention_mask=new_attention_mask,
-            retention_scores=scores_sq,
-            retention_probs=probs_sq,
-            num_selected=num_selected,
+            selected_indices=top_indices,  # (batch, K)
+            selected_hidden_states=selected_hidden_states,  # (batch, K, hidden)
+            new_attention_mask=new_attention_mask,  # (batch, K)
+            retention_scores=retention_scores,
+            retention_probs=retention_probs,
+            num_selected=K,
             num_original=seq_len
         )
 
@@ -203,7 +169,7 @@ class AdaptiveDistilBertQA(nn.Module):
         freeze_transformer: bool = True,
         hidden_dimension: int = HIDDEN_DIMENSION,
         apply_retention_per_layer: Optional[List[bool]] = None,
-        retention_ratio: float = 0.75
+        retention_schedule: Optional[List[float]] = None
     ):
         """
         Initialize adaptive DistilBERT QA model.
@@ -215,14 +181,14 @@ class AdaptiveDistilBertQA(nn.Module):
             hidden_dimension: Hidden dimension (768 for DistilBERT)
             apply_retention_per_layer: List of bools indicating which layers to apply retention to.
                                       If None, apply to all layers.
-            retention_ratio: Target retention ratio for each layer (0.0 to 1.0)
+            retention_schedule: List of target retention ratios for each layer (0.0 to 1.0)
         """
         super().__init__()
         
         self.model_name = model_name
         self.device = device or DEVICE
         self.hidden_dimension = hidden_dimension
-        self.retention_ratio = retention_ratio
+        self.retention_schedule = retention_schedule or [0.90, 0.85, 0.80, 0.75, 0.70, 0.70]
         self.num_layers = 6
         
         # Load pretrained model
@@ -273,14 +239,8 @@ class AdaptiveDistilBertQA(nn.Module):
         Returns:
             Boolean mask (seq_len,) where True = protected
         """
-        seq_len = input_ids.shape[1]
-        protected_mask = torch.zeros(seq_len, dtype=torch.bool, device=self.device)
-        
-        # For single example (batch_size=1), check first row
-        input_ids_sq = input_ids[0]
-        
         # Mark [CLS] (101) and [SEP] (102) as protected
-        protected_mask = (input_ids_sq == 101) | (input_ids_sq == 102)
+        protected_mask = (input_ids == 101) | (input_ids == 102)
         
         return protected_mask
     
@@ -326,7 +286,7 @@ class AdaptiveDistilBertQA(nn.Module):
         current_attention_mask = attention_mask
         
         # Track token indices for reconstruction
-        token_index_mapping = torch.arange(original_seq_len, device=self.device)
+        token_index_mapping = torch.arange(original_seq_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
         
         for layer_idx, layer in enumerate(self.distilbert.transformer.layer):
             # Apply Transformer layer
@@ -355,6 +315,8 @@ class AdaptiveDistilBertQA(nn.Module):
                     temperature=1.0
                 )
                 
+                current_ratio = self.retention_schedule[layer_idx]
+                
                 # Select top-K tokens
                 selection_result = self.token_selector.select_top_k(
                     hidden_states=hidden_states,
@@ -362,7 +324,7 @@ class AdaptiveDistilBertQA(nn.Module):
                     retention_scores=scores,
                     protected_mask=protected_mask,
                     attention_mask=current_attention_mask,
-                    retention_ratio=self.retention_ratio
+                    retention_ratio=current_ratio
                 )
                 
                 # Update hidden states and attention mask
@@ -370,8 +332,8 @@ class AdaptiveDistilBertQA(nn.Module):
                 current_attention_mask = selection_result.new_attention_mask
                 
                 # Update token mapping for later reconstruction
-                protected_mask = protected_mask[selection_result.selected_indices]
-                token_index_mapping = token_index_mapping[selection_result.selected_indices]
+                protected_mask = torch.gather(protected_mask, 1, selection_result.selected_indices)
+                token_index_mapping = torch.gather(token_index_mapping, 1, selection_result.selected_indices)
                 
                 # Record metrics
                 layer_metrics['retention_ratios'].append(selection_result.retention_ratio)
@@ -388,22 +350,20 @@ class AdaptiveDistilBertQA(nn.Module):
         end_logits_final = qa_logits_output[:, :, 1]
         
         # Pad/reconstruct logits to original sequence length
-        # For now, create zero-padded versions
-        start_logits_padded = torch.zeros(
-            batch_size,
-            original_seq_len,
+        start_logits_padded = torch.full(
+            (batch_size, original_seq_len),
+            -1e4,
             device=self.device
         )
-        end_logits_padded = torch.zeros(
-            batch_size,
-            original_seq_len,
+        end_logits_padded = torch.full(
+            (batch_size, original_seq_len),
+            -1e4,
             device=self.device
         )
         
-        # Fill in the values at the positions of selected tokens
-        for i, idx in enumerate(token_index_mapping):
-            start_logits_padded[0, idx] = start_logits_final[0, i]
-            end_logits_padded[0, idx] = end_logits_final[0, i]
+        # Scatter the logits back to their original positions
+        start_logits_padded.scatter_(1, token_index_mapping, start_logits_final)
+        end_logits_padded.scatter_(1, token_index_mapping, end_logits_final)
         
         if return_layer_metrics:
             return start_logits_padded, end_logits_padded, layer_metrics
@@ -441,7 +401,7 @@ class AdaptiveQAInference:
         self,
         model_name: str = MODEL_NAME,
         device: Optional[torch.device] = None,
-        retention_ratio: float = 0.75
+        retention_schedule: Optional[List[float]] = None
     ):
         """
         Initialize adaptive QA inference wrapper.
@@ -449,17 +409,17 @@ class AdaptiveQAInference:
         Args:
             model_name: Pretrained model identifier
             device: Device for computation
-            retention_ratio: Target retention ratio for each layer
+            retention_schedule: Target retention ratio for each layer
         """
         self.device = device or DEVICE
-        self.retention_ratio = retention_ratio
+        self.retention_schedule = retention_schedule or [0.90, 0.85, 0.80, 0.75, 0.70, 0.70]
         
         # Create adaptive model
         self.adaptive_model = AdaptiveDistilBertQA(
             model_name=model_name,
             device=self.device,
             freeze_transformer=True,
-            retention_ratio=retention_ratio
+            retention_schedule=self.retention_schedule
         )
         self.adaptive_model.eval()
     
@@ -498,7 +458,7 @@ class AdaptiveQAInference:
         
         return start_idx, end_idx, layer_metrics
     
-    def set_retention_ratio(self, retention_ratio: float):
-        """Update retention ratio for all layers."""
-        self.retention_ratio = retention_ratio
-        self.adaptive_model.retention_ratio = retention_ratio
+    def set_retention_schedule(self, retention_schedule: List[float]):
+        """Update retention schedule for all layers."""
+        self.retention_schedule = retention_schedule
+        self.adaptive_model.retention_schedule = retention_schedule
