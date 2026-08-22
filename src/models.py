@@ -228,3 +228,60 @@ class AdaptiveMemoryRetention(nn.Module):
         gated_hidden_states = self.gate(hidden_states, probabilities)
         
         return gated_hidden_states, probabilities, scores
+
+def physical_compaction(
+    hidden_states: torch.Tensor,
+    probabilities: torch.Tensor,
+    attention_mask: torch.Tensor,
+    original_indices: torch.Tensor,
+    target_budget: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Physically reduce sequence length by keeping top-k tokens (for batch_size=1 only).
+    """
+    assert hidden_states.shape[0] == 1, "Physical compaction only supports batch_size=1."
+    
+    seq_len = hidden_states.shape[1]
+    if seq_len <= target_budget:
+        return hidden_states, attention_mask, original_indices
+        
+    # Get top-k indices based on probabilities
+    # We must sort the top-k indices to preserve the original sequence order!
+    _, topk_indices_unordered = torch.topk(probabilities[0], target_budget)
+    topk_indices, _ = torch.sort(topk_indices_unordered)
+    
+    # Gather physically compacted tensors
+    # hidden_states: (1, seq_len, hidden_dim) -> (1, budget, hidden_dim)
+    topk_indices_hidden = topk_indices.unsqueeze(0).unsqueeze(-1).expand(1, target_budget, hidden_states.shape[-1])
+    compacted_hidden = torch.gather(hidden_states, 1, topk_indices_hidden)
+    
+    # attention_mask: (1, seq_len) -> (1, budget)
+    compacted_mask = torch.gather(attention_mask, 1, topk_indices.unsqueeze(0))
+    
+    # original_indices: (seq_len,) -> (budget,)
+    compacted_indices = torch.gather(original_indices, 0, topk_indices)
+    
+    return compacted_hidden, compacted_mask, compacted_indices
+
+
+class LayerwiseAdaptiveMemory(nn.Module):
+    """
+    Holds independent RetentionScorers for each Transformer layer.
+    """
+    def __init__(
+        self,
+        num_layers: int = 6,
+        hidden_dimension: int = HIDDEN_DIMENSION,
+        dropout: float = RETENTION_SCORER_DROPOUT
+    ):
+        super().__init__()
+        self.num_layers = num_layers
+        self.scorers = nn.ModuleList([
+            RetentionScorer(hidden_dimension, dropout) for _ in range(num_layers)
+        ])
+    
+    def forward(self, layer_idx: int, hidden_states: torch.Tensor, temperature: float = 1.0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Score tokens using the specific layer's scorer.
+        """
+        return self.scorers[layer_idx](hidden_states, temperature)
