@@ -16,35 +16,28 @@
 
 ---
 
-## Current Implementation
+## Current Implementation Progress
 
-### ✅ Fully Implemented & Working
+### ✅ Phase 1: Baseline Architecture
 - **config.py** - Centralized hyperparameters
-- **src/data.py** - Tokenization, answer span location, token masking
-- **src/models.py** - RetentionScorer (importance predictor), SoftRetentionGate
-- **src/losses.py** - QA loss + budget loss + entropy loss
+- **src/data.py** - Base tokenization, answer span location, token masking
+- **src/models.py** - Initial RetentionScorer (importance predictor) & SoftRetentionGate
 - **src/baseline.py** - DistilBERT wrapper, hidden state extraction
-- **src/training.py** - Training loop with logging and checkpointing
-- **src/evaluation.py** - Token ranking, metrics, analysis
-- **src/utils.py** - Utilities (device, reproducibility, checkpointing)
-- **main.py** - Complete end-to-end pipeline (11 steps)
-- **examples.py** - Simple usage demonstrations
 
-### ✅ Working Capabilities
-- Load pre-trained DistilBERT (66.4M parameters)
-- Tokenize Q&A pairs with answer span localization
-- Extract hidden states from all 6 layers
-- Learn token importance via gradient descent
-- Rank tokens by retention probability
-- Predict with retained vs. baseline representations
-- Multi-objective optimization with configurable loss weights
+### ✅ Phase 2: Layer-wise Physical Token Pruning
+- **src/models_adaptive.py** - `TokenSelector` implementing discrete layer-wise Top-K selection. Enables *actual* tensor compaction (e.g. 31 → 24 → 19 tokens).
+- **src/losses.py** - Multi-objective loss formulation (QA + Budget + Entropy).
+- **src/training_layerwise.py** - `LayerwiseAdaptiveTrainer` for jointly training the 6 layer-wise retention scorers alongside the QA objective.
+- **test_batching.py** - Verified index sorting, logit reconstruction via `scatter_`, and exact tensor shape preservation during deterministic Top-K pruning.
 
-### ❌ NOT Yet Implemented
-- Actual token pruning (currently soft gating only)
-- Layer-wise retention (end-to-end token reduction)
-- Batch processing (single example only)
-- Dataset training (SQuAD, etc.)
-- Efficiency benchmarking (actual speedup measurement)
+### ✅ Phase 3: SQuAD Dataset & Batched Evaluation
+- **src/squad_data.py** - Robust data pipeline utilizing Hugging Face `datasets`. Incorporates standard SQuAD token-mapping, handling truncated sliding windows (`doc_stride`).
+- **train_squad.py** - Batched training script over SQuAD dataset subsets.
+- **evaluate_squad.py** - Baseline vs. AMMR comparative evaluation logic for extracting validation Exact Match (EM), F1 Score, Latency, and Estimated Attention Costs across configured retention ratios.
+
+### ❌ Next Steps (Phase 4 & 5)
+- **Stochastic Relaxation (Phase 4):** Swap deterministic Top-K with differentiable Hard-Concrete / Gumbel-Softmax gating to enable backpropagation through the index selection.
+- **Full Dataset Training (Phase 5):** End-to-end training over the entire 87k SQuAD training dataset with stochastic gating.
 
 ---
 
@@ -102,19 +95,28 @@ ranking = analyzer.get_token_ranking()
 
 ---
 
-## Key Results (Single QA Example)
+## Key Results: Accuracy-Efficiency Trade-off (Phase 3)
 
-| Metric | Value |
-|--------|-------|
-| Question | "What is artificial intelligence?" |
-| Answer | "a field of computer science" (tokens 10-14) |
-| Total Tokens | 31 |
-| Protected Tokens | 3 ([CLS], [SEP], [SEP]) |
-| Baseline Accuracy | ✅ 100% (EM=1.0, F1=1.0) |
-| After Training | ✅ Still 100% (soft gating preserves) |
-| Expected Retained | 10.4/28 (37.3%) |
-| Top Important Tokens | "science", "a", "that", "of" |
-| Training Convergence | Loss: 0.544 → 0.0066 (stable) |
+After implementing batched physical token pruning and training our `RetentionScorer` modules on a small SQuAD subset, we ran evaluations across uniform retention schedules (`r = 0.9` to `0.5`). 
+
+| Model / Ratio | Exact Match | F1 Score | Tokens Retained | Attn Cost (est) | Latency/batch |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | 75.00 | 82.26 | 100.0% | 100.0% | 1579.61 ms |
+| AMMR (r=0.90) | 22.00 | 27.15 | 89.9% | 80.8% | 1752.91 ms |
+| AMMR (r=0.80) | 10.00 | 13.05 | 79.8% | 63.7% | 1288.76 ms |
+| AMMR (r=0.70) | 0.00 | 0.26 | 69.8% | 48.8% | 1188.23 ms |
+| AMMR (r=0.60) | 0.00 | 0.76 | 59.9% | 35.8% | 898.80 ms |
+| AMMR (r=0.50) | 0.00 | 0.44 | 50.0% | 25.0% | 743.73 ms |
+
+### Explanation of Results
+
+1. **Efficiency Gains Achieved:** 
+   The model effectively speeds up sequence processing. At a 50% retention limit, the average CPU latency drops from ~1.58s to ~0.74s, representing over a **50% speedup**. Additionally, the estimated Attention Cost—which scales quadratically $O(N^2)$—drops by a massive **75%**. Note that at $r=0.9$, latency is slightly higher than the baseline due to the non-fused PyTorch overhead of running `top-k` and `scatter_` operations on small sequences.
+
+2. **Accuracy Degradation:**
+   As seen in the table, Exact Match and F1 crash heavily even at a 90% retention ratio. Why? Because the `torch.topk` physical selection is a **discrete, non-differentiable operation**. While the model trains, the loss gradients cannot flow back through the index selection step to tell the scorers which "dropped" tokens should have been retained. 
+
+**Next Step (Phase 4):** To resolve the accuracy drop, we will implement **Stochastic Relaxation** (Hard-Concrete / Gumbel-Softmax gating), making the token pruning operation mathematically differentiable.
 
 ---
 
@@ -162,12 +164,6 @@ Predict with retained representation
 
 ---
 
-## Status: ✅ Production Ready
+## Status: ✅ Phase 3 Complete, Proceeding to Phase 4
 
-All core modules tested and working end-to-end. Framework is modular, documented, and ready for:
-- Experimentation with different retention ratios
-- Extension with new loss functions or model components
-- Dataset scaling (beyond single example)
-- Integration with downstream tasks
-
-See TESTING_GUIDE.md for complete validation procedures.
+All foundational and data components are working. The framework currently successfully compacts layers physically in batches but suffers from missing gradients due to deterministic Top-K operation. We are now preparing to implement stochastic Hard-Concrete pruning (Phase 4).
