@@ -191,22 +191,23 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     step: int,
-    checkpoint_path: str
+    checkpoint_path: str,
+    **kwargs
 ) -> None:
     """
-    Save model checkpoint.
-    
-    Args:
-        model: Model to save.
-        optimizer: Optimizer state to save.
-        step: Current training step.
-        checkpoint_path: Path to save checkpoint.
+    Save model checkpoint with arbitrary kwargs.
     """
     checkpoint = {
         'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
         'step': step,
     }
+    if optimizer is not None:
+        checkpoint['optimizer_state_dict'] = optimizer.state_dict()
+    
+    # Save any extra configuration
+    for k, v in kwargs.items():
+        checkpoint[k] = v
+        
     torch.save(checkpoint, checkpoint_path)
     print(f"Checkpoint saved to {checkpoint_path}")
 
@@ -215,27 +216,20 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     checkpoint_path: str
-) -> int:
+) -> dict:
     """
     Load model checkpoint.
-    
-    Args:
-        model: Model to load into.
-        optimizer: Optimizer to load state into (optional).
-        checkpoint_path: Path to checkpoint file.
-        
-    Returns:
-        Saved training step.
+    Returns the full checkpoint dict.
     """
     checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
     model.load_state_dict(checkpoint['model_state_dict'])
     
-    if optimizer is not None:
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     
     step = checkpoint.get('step', 0)
     print(f"Checkpoint loaded from {checkpoint_path} at step {step}")
-    return step
+    return checkpoint
 
 
 # =====================================================================

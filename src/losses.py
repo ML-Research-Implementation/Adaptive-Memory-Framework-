@@ -228,3 +228,115 @@ class QALossFunction(nn.Module):
             end_target,
             reduction=self.reduction
         )
+
+def calculate_distillation_loss(
+    student_start_logits: torch.Tensor,
+    student_end_logits: torch.Tensor,
+    teacher_start_logits: torch.Tensor,
+    teacher_end_logits: torch.Tensor,
+    temperature: float = 2.0
+) -> torch.Tensor:
+    """
+    Calculate KL-Divergence distillation loss between student and teacher logits.
+    """
+    # Softmax with temperature
+    student_start_log_probs = F.log_softmax(student_start_logits / temperature, dim=-1)
+    student_end_log_probs = F.log_softmax(student_end_logits / temperature, dim=-1)
+    
+    teacher_start_probs = F.softmax(teacher_start_logits / temperature, dim=-1)
+    teacher_end_probs = F.softmax(teacher_end_logits / temperature, dim=-1)
+    
+    # KL Divergence
+    start_loss = F.kl_div(student_start_log_probs, teacher_start_probs, reduction='batchmean')
+    end_loss = F.kl_div(student_end_log_probs, teacher_end_probs, reduction='batchmean')
+    
+    # Multiply by temperature squared to scale gradients back to normal
+    distill_loss = (start_loss + end_loss) / 2.0 * (temperature ** 2)
+    
+    return distill_loss
+
+def calculate_lagrangian_budget_loss(
+    expected_retained_tokens: torch.Tensor,
+    target_budget: float,
+    lagrangian_multiplier: float
+) -> torch.Tensor:
+    """
+    Calculate Lagrangian budget loss for the model parameters.
+    
+    Loss = lambda * (E[tokens] - Budget)
+    Minimizing this pushes the model to use fewer tokens if E[tokens] > Budget,
+    or allows more tokens if E[tokens] < Budget (up to a point, since lambda >= 0).
+    """
+    return lagrangian_multiplier * (expected_retained_tokens - target_budget)
+
+
+def calculate_hidden_state_distillation_loss(
+    student_hidden: torch.Tensor,
+    teacher_hidden: torch.Tensor,
+    selected_indices: torch.Tensor,
+    attention_mask: torch.Tensor,
+    mse_weight: float = 1.0,
+    cos_weight: float = 1.0
+) -> torch.Tensor:
+    """
+    Calculate hidden-state distillation loss for a single layer.
+    Uses a combination of normalized MSE and cosine similarity.
+    
+    Args:
+        student_hidden: Gated and compacted hidden states from the student (batch, K, hidden_dim).
+        teacher_hidden: Full hidden states from the teacher (batch, seq_len, hidden_dim).
+        selected_indices: Indices of the surviving tokens in the student (batch, K).
+        attention_mask: Mask for the student tokens (batch, K), where 0 means padding.
+        mse_weight: Weight for normalized MSE component.
+        cos_weight: Weight for cosine distance component.
+        
+    Returns:
+        Combined loss scalar for this layer.
+    """
+    batch_size, K, hidden_dim = student_hidden.shape
+    
+    # 1. Align Teacher Hidden States
+    # Gather the teacher tokens that correspond to the surviving student tokens
+    expanded_indices = selected_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+    aligned_teacher_hidden = torch.gather(teacher_hidden, 1, expanded_indices)
+    
+    # 2. Apply Attention Mask (don't penalize padded tokens in the compacted sequence)
+    # The mask is 1 for valid tokens and 0 for padding.
+    mask = attention_mask.unsqueeze(-1).expand_as(student_hidden).float()
+    masked_student = student_hidden * mask
+    masked_teacher = aligned_teacher_hidden * mask
+    
+    # Normalization factor for loss (number of actual tokens)
+    num_valid_tokens = attention_mask.sum()
+    if num_valid_tokens == 0:
+        return torch.tensor(0.0, device=student_hidden.device)
+    
+    total_loss = 0.0
+    
+    # 3. Normalized MSE Loss
+    if mse_weight > 0.0:
+        # Normalize vectors by their hidden_dim size to stabilize gradients
+        mse = F.mse_loss(masked_student, masked_teacher, reduction='sum')
+        normalized_mse = mse / (num_valid_tokens * hidden_dim)
+        total_loss += mse_weight * normalized_mse
+        
+    # 4. Cosine Similarity Loss
+    if cos_weight > 0.0:
+        # Cosine embedding loss expects targets = 1 for similarity
+        # Reshape to (batch * K, hidden_dim)
+        flat_student = masked_student.view(-1, hidden_dim)
+        flat_teacher = masked_teacher.view(-1, hidden_dim)
+        flat_mask = attention_mask.view(-1)
+        
+        # Only compute cosine similarity for valid tokens
+        valid_student = flat_student[flat_mask > 0.5]
+        valid_teacher = flat_teacher[flat_mask > 0.5]
+        
+        if valid_student.size(0) > 0:
+            target = torch.ones(valid_student.size(0), device=student_hidden.device)
+            cos_loss = F.cosine_embedding_loss(
+                valid_student, valid_teacher, target, margin=0.0, reduction='mean'
+            )
+            total_loss += cos_weight * cos_loss
+            
+    return total_loss

@@ -45,9 +45,14 @@ def compute_f1(a_gold, a_pred):
     f1 = (2 * precision * recall) / (precision + recall)
     return f1
 
-def evaluate_model(model_fn, dataloader, dataset_features, raw_val_data, tokenizer, is_baseline=False):
-    if hasattr(model_fn, 'eval'):
-        model_fn.eval()
+def evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer, is_baseline=False, threshold_bias=0.0):
+    """
+    Evaluates a model (Baseline or AMMR) on the SQuAD validation set.
+    """
+    if hasattr(model, 'eval'):
+        model.eval()
+    elif hasattr(model, 'qa_model'):
+        model.qa_model.eval()
     all_start_logits = []
     all_end_logits = []
     
@@ -57,6 +62,13 @@ def evaluate_model(model_fn, dataloader, dataset_features, raw_val_data, tokeniz
     total_retained_tokens = 0
     total_original_tokens = 0
     
+    # Track Answer-Span Survival per layer
+    layer_span_survival = [0] * 6
+    layer_span_total = [0] * 6
+    
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(DEVICE)
+        
     print(f"Running inference...")
     for batch in tqdm(dataloader, leave=False):
         input_ids = batch['input_ids'].to(DEVICE)
@@ -65,12 +77,18 @@ def evaluate_model(model_fn, dataloader, dataset_features, raw_val_data, tokeniz
         start_time = time.perf_counter()
         with torch.no_grad():
             if is_baseline:
-                outputs = model_fn.qa_model(input_ids, attention_mask)
+                if hasattr(model, 'qa_model'):
+                    outputs = model.qa_model(input_ids, attention_mask)
+                else:
+                    outputs = model(input_ids, attention_mask)
                 start_logits = outputs.start_logits
                 end_logits = outputs.end_logits
                 layer_metrics = None
             else:
-                start_logits, end_logits, layer_metrics = model_fn(input_ids, attention_mask, return_layer_metrics=True)
+                # AMMR forward pass
+                start_logits, end_logits, layer_metrics = model(
+                    input_ids, attention_mask, return_layer_metrics=True, training=False, threshold_bias=threshold_bias
+                )
         end_time = time.perf_counter()
         
         total_latency += (end_time - start_time)
@@ -79,14 +97,39 @@ def evaluate_model(model_fn, dataloader, dataset_features, raw_val_data, tokeniz
         all_start_logits.append(start_logits.cpu())
         all_end_logits.append(end_logits.cpu())
         
-        # Track token retention
+        # Track token retention and answer span survival
         if layer_metrics and layer_metrics.get('selection_results'):
             batch_tokens = 0
             batch_original = 0
-            for res in layer_metrics['selection_results']:
+            
+            # Extract ground-truth answer span info
+            start_pos = batch.get('start_positions', torch.zeros_like(input_ids[:, 0]))
+            end_pos = batch.get('end_positions', torch.zeros_like(input_ids[:, 0]))
+            
+            for l_idx, res in enumerate(layer_metrics['selection_results']):
                 if res is not None:
                     batch_tokens += res.num_selected
                     batch_original += res.num_original
+                    
+                    # Check if the answer span survived at this layer
+                    # The mask of kept tokens is implicitly in `res.retention_probs > 0` or we can check the selected indices
+                    # A token is survived if it is in `res.selected_indices`
+                    for b_idx in range(input_ids.size(0)):
+                        s_p = start_pos[b_idx].item()
+                        e_p = end_pos[b_idx].item()
+                        if s_p == 0 and e_p == 0:
+                            continue # No answer span or invalid
+                            
+                        # Get indices selected in this batch element
+                        sel_idx = res.selected_indices[b_idx] # shape: (num_selected,)
+                        
+                        # Check if all tokens from s_p to e_p are in sel_idx
+                        span_indices = torch.arange(s_p, e_p + 1, device=DEVICE)
+                        # Check if all span_indices are in sel_idx
+                        survived = torch.all(torch.isin(span_indices, sel_idx)).item()
+                        
+                        layer_span_survival[l_idx] += survived
+                        layer_span_total[l_idx] += 1
             
             total_retained_tokens += batch_tokens
             total_original_tokens += batch_original
@@ -142,14 +185,21 @@ def evaluate_model(model_fn, dataloader, dataset_features, raw_val_data, tokeniz
     
     avg_retention_ratio = (total_retained_tokens / total_original_tokens * 100) if total_original_tokens > 0 else 100.0
     
-    # Estimate Attention cost (Attention is O(N^2)). 
-    # Original cost per layer is proportional to N^2. Total original cost = 6 * N^2.
-    # New cost = sum((r_i * N)^2).
-    # Since we use uniform retention ratio r across 6 layers, cost = 6 * (r * N)^2 = r^2 * (Original Cost)
-    # So relative cost is exactly avg_retention_ratio^2
+    # Estimate Attention cost and Theoretical Compute Reduction
     attention_cost_ratio = (avg_retention_ratio / 100.0) ** 2 * 100.0
+    compute_reduction = 100.0 - attention_cost_ratio
     
-    return avg_em, avg_f1, avg_latency, avg_retention_ratio, attention_cost_ratio
+    peak_memory = torch.cuda.max_memory_allocated(DEVICE) / (1024 ** 2) if torch.cuda.is_available() else 0.0
+    
+    # Calculate span survival rate
+    span_survival_rates = []
+    for l_idx in range(6):
+        if layer_span_total[l_idx] > 0:
+            span_survival_rates.append(layer_span_survival[l_idx] / layer_span_total[l_idx] * 100.0)
+        else:
+            span_survival_rates.append(100.0) # Baseline or no retention layer
+            
+    return avg_em, avg_f1, avg_latency, avg_retention_ratio, attention_cost_ratio, compute_reduction, peak_memory, span_survival_rates
 
 
 def main():
@@ -184,24 +234,26 @@ def main():
     import os
     
     ammr = AdaptiveDistilBertQA(model_name=MODEL_NAME, device=DEVICE)
-    if os.path.exists("squad_phase3_checkpoint.pt"):
-        load_checkpoint(ammr, optimizer=None, checkpoint_path="squad_phase3_checkpoint.pt")
-        print("Loaded trained AMMR model.")
+    if os.path.exists("squad_phase4_checkpoint.pt"):
+        load_checkpoint(ammr, optimizer=None, checkpoint_path="squad_phase4_checkpoint.pt")
+        print("Loaded trained Phase 4 AMMR model.")
     else:
         print("WARNING: Checkpoint not found, evaluating untrained AMMR.")
         
-    ratios = [0.90, 0.80, 0.70, 0.60, 0.50]
+    # 4. Phase 4 Evaluation Loop (Sweeping over threshold_bias to generate Pareto curve)
+    print("\nStarting AMMR Evaluation Sweep...")
+    
+    # We sweep over a range of threshold biases. Positive bias = retain more, Negative bias = retain fewer
+    biases = [0.0, -2.0, -4.0, -6.0]
     results = []
     
-    for r in ratios:
-        print(f"\nEvaluating AMMR at Ratio: {r}")
-        # Apply uniform ratio to all 6 layers
-        ammr.retention_schedule = [r] * 6
+    for bias in biases:
+        print(f"\nEvaluating AMMR at Bias: {bias}")
         a_em, a_f1, a_lat, a_ret_ratio, a_attn_cost = evaluate_model(
-            ammr, val_dl, val_features, val_data, tokenizer, is_baseline=False
+            ammr, val_dl, val_features, val_data, tokenizer, is_baseline=False, threshold_bias=bias
         )
         results.append({
-            'ratio': r,
+            'bias': bias,
             'em': a_em,
             'f1': a_f1,
             'retention': a_ret_ratio,
@@ -211,12 +263,12 @@ def main():
         
     # Print Table
     print_header("EVALUATION RESULTS: ACCURACY-EFFICIENCY TRADE-OFF")
-    print(f"{'Model / Ratio':<15} | {'Exact Match':<12} | {'F1 Score':<12} | {'Tokens Retained':<17} | {'Attn Cost (est)':<17} | {'Latency/batch':<15}")
+    print(f"{'Model / Bias':<15} | {'Exact Match':<12} | {'F1 Score':<12} | {'Tokens Retained':<17} | {'Attn Cost (est)':<17} | {'Latency/batch':<15}")
     print("-" * 95)
     print(f"{'Baseline':<15} | {b_em:<12.2f} | {b_f1:<12.2f} | {'100.0%':<17} | {'100.0%':<17} | {b_lat:<10.2f} ms")
     
     for res in results:
-        label = f"AMMR (r={res['ratio']:.2f})"
+        label = f"AMMR (b={res['bias']:.1f})"
         ret_str = f"{res['retention']:.1f}%"
         attn_str = f"{res['attn_cost']:.1f}%"
         print(f"{label:<15} | {res['em']:<12.2f} | {res['f1']:<12.2f} | {ret_str:<17} | {attn_str:<17} | {res['latency']:<10.2f} ms")

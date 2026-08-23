@@ -136,6 +136,7 @@ def prepare_validation_features(examples, tokenizer, max_length=384, doc_stride=
     )
 
     sample_mapping = tokenized_examples.pop("overflow_to_sample_mapping")
+    offset_mapping = tokenized_examples.pop("offset_mapping")
     
     # We keep the example_id that gave us this feature and we will store the offset mappings.
     tokenized_examples["example_id"] = []
@@ -151,19 +152,57 @@ def prepare_validation_features(examples, tokenizer, max_length=384, doc_stride=
         
         # Set to None the offset_mapping that are not part of the context so it's easy to determine if a token
         # position is part of the context or not.
-        tokenized_examples["offset_mapping"][i] = [
+        offset_mapping[i] = [
             (o if sequence_ids[k] == context_index else None)
-            for k, o in enumerate(tokenized_examples["offset_mapping"][i])
+            for k, o in enumerate(offset_mapping[i])
         ]
 
+    start_positions = []
+    end_positions = []
+    for i, offsets in enumerate(offset_mapping):
+        input_ids = tokenized_examples["input_ids"][i]
+        cls_index = input_ids.index(tokenizer.cls_token_id)
+        sequence_ids = tokenized_examples.sequence_ids(i)
+        sample_index = sample_mapping[i]
+        answers = examples["answers"][sample_index]
+        
+        if len(answers["answer_start"]) == 0:
+            start_positions.append(cls_index)
+            end_positions.append(cls_index)
+        else:
+            start_char = answers["answer_start"][0]
+            end_char = start_char + len(answers["text"][0])
+            
+            token_start_index = 0
+            while sequence_ids[token_start_index] != 1:
+                token_start_index += 1
+                
+            token_end_index = len(input_ids) - 1
+            while sequence_ids[token_end_index] != 1:
+                token_end_index -= 1
+                
+            if offsets[token_start_index] is None or offsets[token_end_index] is None or not (offsets[token_start_index][0] <= start_char and offsets[token_end_index][1] >= end_char):
+                start_positions.append(cls_index)
+                end_positions.append(cls_index)
+            else:
+                while token_start_index < len(offsets) and offsets[token_start_index] is not None and offsets[token_start_index][0] <= start_char:
+                    token_start_index += 1
+                start_positions.append(token_start_index - 1)
+                
+                while token_end_index >= 0 and offsets[token_end_index] is not None and offsets[token_end_index][1] >= end_char:
+                    token_end_index -= 1
+                end_positions.append(token_end_index + 1)
+                
     # Convert to list of dicts
     features = []
     for i in range(len(tokenized_examples["input_ids"])):
         features.append({
             "input_ids": tokenized_examples["input_ids"][i],
             "attention_mask": tokenized_examples["attention_mask"][i],
+            "start_positions": start_positions[i],
+            "end_positions": end_positions[i],
             "example_id": tokenized_examples["example_id"][i],
-            "offset_mapping": tokenized_examples["offset_mapping"][i]
+            "offset_mapping": offset_mapping[i]
         })
         
     return features
@@ -180,7 +219,7 @@ def get_squad_dataloaders(
     Loads SQuAD and returns train/val DataLoaders and raw datasets for evaluation.
     """
     print("Loading SQuAD dataset...")
-    datasets = load_dataset("squad")
+    datasets = load_dataset("rajpurkar/squad")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     
     train_data = datasets["train"]

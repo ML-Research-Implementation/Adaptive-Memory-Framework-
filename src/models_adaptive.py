@@ -17,6 +17,49 @@ from transformers import DistilBertForQuestionAnswering
 from config import MODEL_NAME, DEVICE, HIDDEN_DIMENSION
 from src.models import RetentionScorer
 
+class HardConcreteGate(nn.Module):
+    """
+    Hard-Concrete (or Gumbel-Softmax) gate for differentiable binary decisions.
+    Outputs continuous z in [0, 1] during training, and discrete z in {0, 1} at inference.
+    """
+    def __init__(self, temperature=0.5, stretch_min=-0.1, stretch_max=1.1):
+        super().__init__()
+        self.temp = temperature
+        self.stretch_min = stretch_min
+        self.stretch_max = stretch_max
+        
+    def forward(self, logits: torch.Tensor, training: bool = True, threshold_bias: float = 0.0) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            logits: Unnormalized log probabilities (batch, seq_len)
+            training: If True, adds Gumbel noise.
+            threshold_bias: Optional bias to adjust retention rate during inference.
+            
+        Returns:
+            z: Gate values (batch, seq_len) in [0, 1]
+            l0_penalty: Expected probability of keeping the token, for budget constraint
+        """
+        if training:
+            u = torch.rand_like(logits)
+            # Logistic noise
+            noise = torch.log(u + 1e-8) - torch.log(1 - u + 1e-8)
+            s = torch.sigmoid((logits + noise) / self.temp)
+        else:
+            # Deterministic at inference, apply threshold bias
+            s = torch.sigmoid(logits + threshold_bias)
+            
+        # Stretch
+        s_stretched = s * (self.stretch_max - self.stretch_min) + self.stretch_min
+        # Hard clamp
+        z = torch.clamp(s_stretched, 0.0, 1.0)
+        
+        # Exact expected L0 penalty (P(z > 0))
+        shift = -self.stretch_min / (self.stretch_max - self.stretch_min)
+        l0_penalty = torch.sigmoid(logits - self.temp * torch.log(torch.tensor(shift / (1 - shift), device=logits.device)))
+        
+        return z, l0_penalty
+
+
 
 class TokenSelectionResult:
     """Container for token selection outputs."""
@@ -55,88 +98,80 @@ class TokenSelectionResult:
 
 class TokenSelector:
     """
-    Handles deterministic Top-K token selection with protection for special tokens.
+    Handles adaptive token selection using Hard-Concrete gates.
     """
-    
-    def __init__(
-        self,
-        device: Optional[torch.device] = None,
-        min_tokens_to_keep: int = 3
-    ):
-        """
-        Initialize token selector.
-        
-        Args:
-            device: Device for tensor operations.
-            min_tokens_to_keep: Minimum number of tokens to retain (including protected).
-        """
+    def __init__(self, device: Optional[torch.device] = None):
         self.device = device or DEVICE
-        self.min_tokens_to_keep = min_tokens_to_keep
+        self.gate = HardConcreteGate()
     
-    def select_top_k(
+    def select_adaptive(
         self,
         hidden_states: torch.Tensor,
-        retention_probs: torch.Tensor,
         retention_scores: torch.Tensor,
         protected_mask: torch.Tensor,
         attention_mask: torch.Tensor,
-        retention_ratio: float
+        training: bool = True,
+        threshold_bias: float = 0.0
     ) -> TokenSelectionResult:
         """
-        Select top-K tokens based on retention probability, protecting special tokens.
-        
-        Args:
-            hidden_states: Token hidden states (batch, seq_len, hidden_dim)
-            retention_probs: Retention probabilities (batch, seq_len)
-            retention_scores: Raw retention scores (batch, seq_len)
-            protected_mask: Boolean mask for protected tokens (seq_len,) - True if protected
-            attention_mask: Original attention mask (batch, seq_len) - 1 if valid, 0 if padding
-            retention_ratio: Target retention ratio (0.0 to 1.0)
-            
-        Returns:
-            TokenSelectionResult with selected tokens and metadata
+        Dynamically selects tokens based on Hard-Concrete gates.
+        Physically compacts the tensor, padding only to the maximum retained length in the batch.
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
-        # Calculate target number of tokens to select K (common across the batch)
-        K = max(self.min_tokens_to_keep, int(seq_len * retention_ratio))
-        K = min(K, seq_len)
+        # 1. Compute differentiable gate and L0 penalty
+        z, l0_penalty = self.gate(retention_scores, training=training, threshold_bias=threshold_bias)
         
-        # Create a modified scores tensor for selection
-        scores_adaptive = retention_scores.clone()
+        # 2. Force protected tokens to be kept (z=1)
+        z = torch.where(protected_mask, torch.ones_like(z), z)
         
-        # Push padding tokens to -inf so they are dropped
+        # Also force padding tokens to 0 so they don't contribute to budget or get selected
         padding_mask = attention_mask < 0.5
-        scores_adaptive.masked_fill_(padding_mask, float('-inf'))
+        z = torch.where(padding_mask, torch.zeros_like(z), z)
+        l0_penalty = torch.where(padding_mask, torch.zeros_like(l0_penalty), l0_penalty)
         
-        # Push protected tokens to +inf so they are always selected
-        protected_mask_device = protected_mask.to(self.device)
-        scores_adaptive.masked_fill_(protected_mask_device, float('inf'))
+        # 3. Determine binary keep mask based on z > 0
+        keep_mask = z > 0
         
-        # Select Top-K indices for the batch
-        # top_indices will be shape (batch_size, K)
-        _, top_indices = torch.topk(scores_adaptive, k=K, dim=1)
+        # Calculate how many tokens are retained per example
+        retained_counts = keep_mask.sum(dim=1)
+        max_retained = retained_counts.max().item()
         
-        # Sort indices to preserve temporal order
-        top_indices, _ = torch.sort(top_indices, dim=1)
+        # If nothing is retained (shouldn't happen due to protected tokens), fallback
+        if max_retained == 0:
+            max_retained = 1
+            
+        # 4. Multiply hidden states by continuous z for gradient flow
+        gated_hidden = hidden_states * z.unsqueeze(-1)
         
-        # Apply soft gate before extraction to enable gradient flow to probabilities
-        gated_hidden = hidden_states * retention_probs.unsqueeze(-1)
+        # 5. Extract selected indices while preserving temporal order
+        # We assign a high penalty to dropped tokens so they sort to the end
+        indices = torch.arange(seq_len, device=self.device).unsqueeze(0).expand(batch_size, -1)
+        sort_keys = indices + (~keep_mask).long() * 10000
         
-        # Gather selected hidden states
-        expanded_indices = top_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
-        selected_hidden_states = torch.gather(gated_hidden, 1, expanded_indices)  # (batch, K, hidden)
+        _, sorted_indices = torch.sort(sort_keys, dim=1)
         
-        # Create new attention mask
-        new_attention_mask = torch.gather(attention_mask, 1, top_indices)
+        # Take only up to max_retained
+        selected_indices = sorted_indices[:, :max_retained]
+        
+        # 6. Gather the physically compacted tensors
+        expanded_indices = selected_indices.unsqueeze(-1).expand(-1, -1, hidden_dim)
+        selected_hidden_states = torch.gather(gated_hidden, 1, expanded_indices)
+        
+        # 7. Update Attention Mask
+        # We gathered tokens up to max_retained. Some might be dropped tokens (padding for the batch).
+        # We need to set their attention mask to 0.
+        new_attention_mask = torch.gather(attention_mask, 1, selected_indices)
+        is_retained = torch.gather(keep_mask, 1, selected_indices)
+        new_attention_mask = new_attention_mask * is_retained.float()
         
         return TokenSelectionResult(
-            selected_indices=top_indices,  # (batch, K)
-            selected_hidden_states=selected_hidden_states,  # (batch, K, hidden)
-            new_attention_mask=new_attention_mask,  # (batch, K)
+            selected_indices=selected_indices,
+            selected_hidden_states=selected_hidden_states,
+            new_attention_mask=new_attention_mask,
             retention_scores=retention_scores,
-            retention_probs=retention_probs,
-            num_selected=K,
+            retention_probs=l0_penalty,  # Store expected penalty here for convenience
+            num_selected=max_retained,
             num_original=seq_len
         )
 
@@ -248,7 +283,9 @@ class AdaptiveDistilBertQA(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        return_layer_metrics: bool = True
+        return_layer_metrics: bool = True,
+        training: bool = False,
+        threshold_bias: float = 0.0
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[Dict]]:
         """
         Forward pass with layer-wise retention.
@@ -271,7 +308,8 @@ class AdaptiveDistilBertQA(nn.Module):
         layer_metrics = {
             'tokens_per_layer': [],
             'retention_ratios': [],
-            'selection_results': []
+            'selection_results': [],
+            'expected_retained_tokens': 0.0  # Accumulate global budget here
         }
         
         # Create protected mask
@@ -297,11 +335,16 @@ class AdaptiveDistilBertQA(nn.Module):
                 # Create attention bias from mask: 1 -> 0 (attend), 0 -> -1e9 (ignore)
                 attn_bias = (1.0 - current_attention_mask[:, None, None, :]) * -1e9
             
+            # Pass hidden_states as positional argument to support different transformers versions
             layer_output = layer(
-                x=hidden_states,
+                hidden_states,
                 attn_mask=attn_bias
             )
-            hidden_states = layer_output[0]  # (batch, seq_len, hidden_dim)
+            
+            if isinstance(layer_output, tuple):
+                hidden_states = layer_output[0]
+            else:
+                hidden_states = layer_output
             
             # Record tokens before retention
             tokens_before = hidden_states.shape[1]
@@ -309,22 +352,21 @@ class AdaptiveDistilBertQA(nn.Module):
             
             # Apply retention if configured for this layer
             if self.apply_retention_per_layer[layer_idx]:
-                # Compute retention scores
-                scores, probs = self.retention_scorers[layer_idx](
+                # Compute retention scores using the linear layer
+                # We ignore the probs returned by RetentionScorer because HardConcreteGate handles it
+                scores, _ = self.retention_scorers[layer_idx](
                     hidden_states,
                     temperature=1.0
                 )
                 
-                current_ratio = self.retention_schedule[layer_idx]
-                
-                # Select top-K tokens
-                selection_result = self.token_selector.select_top_k(
+                # Select tokens adaptively
+                selection_result = self.token_selector.select_adaptive(
                     hidden_states=hidden_states,
-                    retention_probs=probs,
                     retention_scores=scores,
                     protected_mask=protected_mask,
                     attention_mask=current_attention_mask,
-                    retention_ratio=current_ratio
+                    training=training,
+                    threshold_bias=threshold_bias
                 )
                 
                 # Update hidden states and attention mask
@@ -335,12 +377,25 @@ class AdaptiveDistilBertQA(nn.Module):
                 protected_mask = torch.gather(protected_mask, 1, selection_result.selected_indices)
                 token_index_mapping = torch.gather(token_index_mapping, 1, selection_result.selected_indices)
                 
-                # Record metrics
+                # Record metrics and expected tokens
+                # We sum the expected kept tokens per batch element, and mean over the batch
+                expected_kept = selection_result.retention_probs.sum(dim=1).mean()
+                layer_metrics['expected_retained_tokens'] += expected_kept
+                
                 layer_metrics['retention_ratios'].append(selection_result.retention_ratio)
                 layer_metrics['selection_results'].append(selection_result)
+                
+                # Save the hidden states for distillation
+                if 'hidden_states' not in layer_metrics:
+                    layer_metrics['hidden_states'] = []
+                layer_metrics['hidden_states'].append(hidden_states)
             else:
                 layer_metrics['retention_ratios'].append(1.0)
                 layer_metrics['selection_results'].append(None)
+                
+                if 'hidden_states' not in layer_metrics:
+                    layer_metrics['hidden_states'] = []
+                layer_metrics['hidden_states'].append(hidden_states)
         
         # Get final QA logits
         # QA head returns tensor of shape (batch, seq_len, 2)
