@@ -110,39 +110,30 @@ def calculate_entropy_loss(
     eps: float = 1e-7
 ) -> torch.Tensor:
     """
-    Calculate entropy regularization loss.
-    
-    Entropy encourages sharp decisions (probabilities close to 0 or 1)
-    rather than ambiguous middle values (0.5). We compute binary entropy
-    and sum over all adaptive tokens.
-    
-    Binary entropy: H(p) = -[p*log(p) + (1-p)*log(1-p)]
-    
-    Minimizing entropy means reducing uncertainty, pushing decisions to extremes.
-    
-    Args:
-        probabilities: Retention probabilities (batch, seq_len).
-        valid_mask: Mask for adaptive tokens (seq_len,).
-        eps: Small value to avoid log(0).
-        
-    Returns:
-        Mean entropy over adaptive tokens.
+    Calculate entropy regularization loss safely across 1D or 2D masks.
     """
-    # Clamp probabilities to avoid log(0)
-    p = probabilities.clamp(min=eps, max=1 - eps)
+    # 1. Clamp probabilities strictly inside (0, 1) to prevent log(0) -> NaN
+    p = torch.clamp(probabilities, min=eps, max=1.0 - eps)
     
-    # Binary entropy: H = -[p*log(p) + (1-p)*log(1-p)]
-    entropy = -(p * torch.log(p) + (1 - p) * torch.log(1 - p))
+    # 2. Binary entropy formula
+    entropy = -(p * torch.log(p) + (1.0 - p) * torch.log(1.0 - p))
     
-    # Move valid_mask to same device
-    valid_mask = valid_mask.to(entropy.device)
+    # 3. Handle device matching
+    valid_mask = valid_mask.to(entropy.device).float()
     
-    # Apply mask - only count adaptive tokens
-    masked_entropy = entropy * valid_mask.unsqueeze(0)
+    # 4. Correct dimension broadcasting
+    if valid_mask.dim() == 1:
+        # If valid_mask is (seq_len,), expand to (1, seq_len)
+        valid_mask = valid_mask.unsqueeze(0)
     
-    # Average over valid tokens
-    mean_entropy = masked_entropy.sum() / (valid_mask.sum() + eps)
+    masked_entropy = entropy * valid_mask
     
+    # 5. Numerically stable denominator
+    total_valid = valid_mask.sum()
+    if total_valid < 1.0:
+        return torch.tensor(0.0, device=entropy.device, requires_grad=True)
+        
+    mean_entropy = masked_entropy.sum() / total_valid
     return mean_entropy
 
 

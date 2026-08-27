@@ -19,8 +19,7 @@ from src.models import RetentionScorer
 
 class HardConcreteGate(nn.Module):
     """
-    Hard-Concrete (or Gumbel-Softmax) gate for differentiable binary decisions.
-    Outputs continuous z in [0, 1] during training, and discrete z in {0, 1} at inference.
+    Hard-Concrete gate for differentiable binary decisions with stable bounds.
     """
     def __init__(self, temperature=0.5, stretch_min=-0.1, stretch_max=1.1):
         super().__init__()
@@ -29,36 +28,22 @@ class HardConcreteGate(nn.Module):
         self.stretch_max = stretch_max
         
     def forward(self, logits: torch.Tensor, training: bool = True, threshold_bias: float = 0.0) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            logits: Unnormalized log probabilities (batch, seq_len)
-            training: If True, adds Gumbel noise.
-            threshold_bias: Optional bias to adjust retention rate during inference.
-            
-        Returns:
-            z: Gate values (batch, seq_len) in [0, 1]
-            l0_penalty: Expected probability of keeping the token, for budget constraint
-        """
         if training:
-            u = torch.rand_like(logits)
-            # Logistic noise
-            noise = torch.log(u + 1e-8) - torch.log(1 - u + 1e-8)
-            s = torch.sigmoid((logits + noise) / self.temp)
+            # Uniform noise clamped to prevent log(0)
+            u = torch.rand_like(logits).clamp(1e-6, 1.0 - 1e-6)
+            noise = torch.log(u) - torch.log(1.0 - u)
+            s = torch.sigmoid((logits + noise) / max(self.temp, 1e-4))
         else:
-            # Deterministic at inference, apply threshold bias
             s = torch.sigmoid(logits + threshold_bias)
             
-        # Stretch
+        # Stretch and clamp to [0, 1]
         s_stretched = s * (self.stretch_max - self.stretch_min) + self.stretch_min
-        # Hard clamp
         z = torch.clamp(s_stretched, 0.0, 1.0)
         
-        # Exact expected L0 penalty (P(z > 0))
-        shift = -self.stretch_min / (self.stretch_max - self.stretch_min)
-        l0_penalty = torch.sigmoid(logits - self.temp * torch.log(torch.tensor(shift / (1 - shift), device=logits.device)))
+        # Smooth surrogate probability for budget tracking
+        prob = torch.sigmoid(logits).clamp(1e-6, 1.0 - 1e-6)
         
-        return z, l0_penalty
-
+        return z, prob
 
 
 class TokenSelectionResult:
@@ -407,12 +392,12 @@ class AdaptiveDistilBertQA(nn.Module):
         # Pad/reconstruct logits to original sequence length
         start_logits_padded = torch.full(
             (batch_size, original_seq_len),
-            -1e4,
+            -100.0,
             device=self.device
         )
         end_logits_padded = torch.full(
             (batch_size, original_seq_len),
-            -1e4,
+            -100.0,
             device=self.device
         )
         

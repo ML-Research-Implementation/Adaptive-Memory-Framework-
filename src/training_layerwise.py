@@ -1,5 +1,6 @@
 """
 Training loop and trainer for layer-wise adaptive memory models.
+Handles multi-layer training with differentiable token gating.
 """
 
 from typing import Dict, Optional, List, Tuple
@@ -18,19 +19,12 @@ from config import (
 )
 from src.utils import format_number, save_checkpoint, load_checkpoint
 from src.models_adaptive import AdaptiveDistilBertQA
-from src.losses import (
-    calculate_qa_loss,
-    calculate_budget_loss,
-    calculate_entropy_loss
-)
+from src.losses import calculate_budget_loss, calculate_entropy_loss
 
 
 class LayerwiseAdaptiveTrainer:
     """
-    Trainer for learning layer-wise retention probabilities.
-    
-    This trainer handles the complex multi-objective optimization across
-    all Transformer layers simultaneously.
+    Trainer for learning layer-wise retention probabilities across all Transformer layers.
     """
     
     def __init__(
@@ -49,10 +43,10 @@ class LayerwiseAdaptiveTrainer:
         self.budget_lambda = budget_lambda
         self.entropy_lambda = entropy_lambda
         
-        # Unfreeze scorers for training
+        # Unfreeze retention scorers for optimization
         self.model.unfreeze_scorers()
         
-        # Create optimizer for the retention scorers only
+        # Optimize retention scorers only
         self.optimizer = optim.AdamW(
             self.model.get_retention_scorers().parameters(),
             lr=learning_rate,
@@ -76,65 +70,59 @@ class LayerwiseAdaptiveTrainer:
         end_target: torch.Tensor
     ) -> Dict[str, float]:
         """
-        Perform single training step.
-        
-        Args:
-            input_ids: Token IDs (batch, seq_len).
-            attention_mask: Attention mask (batch, seq_len).
-            start_target: Ground truth start indices (batch,).
-            end_target: Ground truth end indices (batch,).
-            
-        Returns:
-            Dictionary with loss components.
+        Perform a single training step.
         """
-        # Forward pass
+        # Ensure tensors are on the target device
+        input_ids = input_ids.to(self.device)
+        attention_mask = attention_mask.to(self.device)
+        start_target = start_target.to(self.device)
+        end_target = end_target.to(self.device)
+
+        # Forward pass with stochastic relaxation active
         start_logits, end_logits, layer_metrics = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            return_layer_metrics=True
+            return_layer_metrics=True,
+            training=True
         )
         
-        # Compute QA Loss
-        # We can't directly use calculate_qa_loss because it expects a qa_model and hidden states.
-        # But we already have start_logits and end_logits, so we compute cross entropy directly.
-        start_loss = torch.nn.functional.cross_entropy(start_logits, start_target)
-        end_loss = torch.nn.functional.cross_entropy(end_logits, end_target)
-        qa_loss = (start_loss + end_loss) / 2
+        # 1. QA Cross-Entropy Loss
+        start_loss = torch.nn.functional.cross_entropy(start_logits, start_target, ignore_index=-100)
+        end_loss = torch.nn.functional.cross_entropy(end_logits, end_target, ignore_index=-100)
+        qa_loss = (start_loss + end_loss) / 2.0
         
-        # Compute Layer-wise Losses
-        total_budget_loss = 0.0
-        total_entropy_loss = 0.0
+        # 2. Layer-wise Budget Loss
+        total_budget_loss = torch.tensor(0.0, device=self.device)
+        total_entropy_loss = torch.tensor(0.0, device=self.device)
         
-        for layer_idx, selection_result in enumerate(layer_metrics['selection_results']):
-            if selection_result is None:
-                continue
+        if layer_metrics and 'selection_results' in layer_metrics:
+            for layer_idx, selection_result in enumerate(layer_metrics['selection_results']):
+                if selection_result is None:
+                    continue
+                    
+                probs = selection_result.retention_probs  # (batch, seq_len)
+                valid_mask = (probs > 0.0)
                 
-            probs = selection_result.retention_probs  # (batch, seq_len)
-            
-            # Reconstruct a valid mask (we can just use all 1s of the same shape)
-            valid_mask = torch.ones_like(probs, dtype=torch.bool)
-            
-            target_ratio = self.model.retention_schedule[layer_idx]
-            # Average sequence length for the batch
-            target_budget = max(3, int(probs.shape[1] * target_ratio))
-            
-            b_loss, _ = calculate_budget_loss(
-                probs,
-                valid_mask,
-                target_budget,
-                penalty_mode='excess'
-            )
-            
-            e_loss = calculate_entropy_loss(probs, valid_mask)
-            
-            total_budget_loss += b_loss
-            total_entropy_loss += e_loss
-            
-        # Combine losses
+                target_ratio = self.model.retention_schedule[layer_idx]
+                target_budget = max(2, int(probs.shape[1] * target_ratio))
+                
+                b_loss, _ = calculate_budget_loss(
+                    probs,
+                    valid_mask,
+                    target_budget,
+                    penalty_mode='excess'
+                )
+                total_budget_loss = total_budget_loss + b_loss
+                
+                if self.entropy_lambda > 0.0:
+                    e_loss = calculate_entropy_loss(probs, valid_mask)
+                    total_entropy_loss = total_entropy_loss + e_loss
+
+        # 3. Combined Total Loss
         total_loss = (
             qa_loss +
-            self.budget_lambda * total_budget_loss +
-            self.entropy_lambda * total_entropy_loss
+            (self.budget_lambda * total_budget_loss) +
+            (self.entropy_lambda * total_entropy_loss)
         )
         
         # Backward pass
@@ -151,7 +139,7 @@ class LayerwiseAdaptiveTrainer:
         self.optimizer.step()
         self.current_step += 1
         
-        # Result dict
+        # Log results
         result = {
             'total': total_loss.item(),
             'qa': qa_loss.item(),
