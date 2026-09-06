@@ -97,7 +97,7 @@ def train(args):
     global_step = 0
     
     use_amp = (DEVICE.type == "cuda")
-    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
     
     if args.resume_from and os.path.exists(args.resume_from):
         from src.utils import load_checkpoint
@@ -116,13 +116,22 @@ def train(args):
     
     print(f"Starting training for {args.epochs} epochs ({total_steps} steps).")
     
+    best_val_score = 0.0
+    
     for epoch in range(start_epoch, args.epochs):
         target_ratio = curriculum[min(epoch, len(curriculum)-1)]
         print(f"\n[Epoch {epoch+1}/{args.epochs}] Curriculum Target: {target_ratio*100:.1f}%")
         
         progress_bar = tqdm(train_dl, desc=f"Epoch {epoch+1}")
         
+        epoch_retention = 0.0
+        epoch_target = 0.0
+        epoch_violation = 0.0
+        num_batches = 0
+        
         for batch in progress_bar:
+            optimizer.zero_grad()
+            
             input_ids = batch['input_ids'].to(DEVICE)
             attention_mask = batch['attention_mask'].to(DEVICE)
             start_target = batch['start_positions'].to(DEVICE)
@@ -192,8 +201,6 @@ def train(args):
                 
                 total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * budget_loss
             
-            optimizer.zero_grad()
-            
             if use_amp:
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
@@ -210,6 +217,11 @@ def train(args):
             with torch.no_grad():
                 violation = (expected_retained - target_budget_per_seq).item()
                 lagrangian_multiplier = max(0.0, lagrangian_multiplier + lagrangian_lr * violation)
+                
+                epoch_retention += expected_retained.item()
+                epoch_target += target_budget_per_seq
+                epoch_violation += violation
+                num_batches += 1
             
             global_step += 1
             
@@ -224,20 +236,46 @@ def train(args):
                     'AnsSurv': f"{span_survived*100:.0f}%"
                 })
         
+        avg_retention = epoch_retention / num_batches
+        avg_target = epoch_target / num_batches
+        avg_violation = epoch_violation / num_batches
+        
+        print(f"Epoch {epoch+1} Budget Stats:")
+        print(f"  Target Retention: {avg_target:.1f} tokens")
+        print(f"  Actual Retention: {avg_retention:.1f} tokens")
+        print(f"  Avg Violation: {avg_violation:.1f} tokens")
+        print(f"  Final Lambda: {lagrangian_multiplier:.4f}")
+        
         val_loss, val_em = evaluate(student, val_dl)
         print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%")
-        # Save model
-        save_checkpoint(
-            student.retention_scorers, 
-            optimizer=optimizer, 
-            step=global_step, 
-            checkpoint_path=f"squad_checkpoint_ep{epoch+1}.pt",
-            scheduler_state_dict=scheduler.state_dict(),
-            epoch=epoch+1,
-            lagrangian_multiplier=lagrangian_multiplier,
-            target_ratio=target_ratio
-        )
         
+        score = val_em
+        is_best = score > best_val_score
+        if is_best:
+            best_val_score = score
+            save_checkpoint(
+                student.retention_scorers, 
+                optimizer=optimizer, 
+                step=global_step, 
+                checkpoint_path="squad_best_checkpoint.pt",
+                scheduler_state_dict=scheduler.state_dict(),
+                epoch=epoch+1,
+                lagrangian_multiplier=lagrangian_multiplier,
+                target_ratio=target_ratio
+            )
+            print(f"Saved new best checkpoint (EM: {score:.2f}%)")
+            
+    # Save final checkpoint
+    save_checkpoint(
+        student.retention_scorers, 
+        optimizer=optimizer, 
+        step=global_step, 
+        checkpoint_path="squad_final_checkpoint.pt",
+        scheduler_state_dict=scheduler.state_dict(),
+        epoch=args.epochs,
+        lagrangian_multiplier=lagrangian_multiplier,
+        target_ratio=target_ratio
+    )
     print(f"\nTraining complete.")
 
 if __name__ == "__main__":
