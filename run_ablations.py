@@ -12,7 +12,6 @@ from src.models_adaptive import AdaptiveDistilBertQA
 from src.baseline import BaselineQAModel
 from src.utils import set_seed, print_header, save_checkpoint, load_checkpoint
 from evaluate_squad import evaluate_model
-from train_phase5 import train_phase5
 
 # We will modify train_phase5 logic slightly here to support ablations
 from torch.optim import AdamW
