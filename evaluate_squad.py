@@ -12,6 +12,7 @@ from src.squad_data import get_squad_dataloaders
 from src.baseline import BaselineQAModel
 from src.models_adaptive import AdaptiveDistilBertQA
 from src.utils import print_header
+import json
 
 
 def normalize_answer(s):
@@ -74,6 +75,8 @@ def evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer,
     layer_span_survival = [0] * 6
     layer_span_total = [0] * 6
     
+    all_retention_scores = []
+    
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats(DEVICE)
         
@@ -131,8 +134,15 @@ def evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer,
                         layer_span_survival[l_idx] += survived
                         layer_span_total[l_idx] += 1
             
+            
             total_retained_tokens += batch_tokens
             total_original_tokens += batch_original
+            
+            # Collect scores for calibration if threshold_bias == 0 (baseline pass)
+            if threshold_bias == 0.0 and layer_metrics and layer_metrics.get('selection_results'):
+                for res in layer_metrics['selection_results']:
+                    if res is not None:
+                        all_retention_scores.append(res.retention_scores.detach().cpu())
         
     avg_latency = (total_latency / max(1, num_batches)) * 1000  # ms
     
@@ -192,7 +202,23 @@ def evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer,
         else:
             span_survival_rates.append(100.0)
             
-    return avg_em, avg_f1, avg_latency, avg_retention_ratio, attention_cost_ratio, compute_reduction, peak_memory, span_survival_rates
+    # Combine retention scores if collected
+    all_scores = torch.cat(all_retention_scores).view(-1) if all_retention_scores else None
+            
+    return avg_em, avg_f1, avg_latency, avg_retention_ratio, attention_cost_ratio, compute_reduction, peak_memory, span_survival_rates, all_scores
+
+def find_best_threshold(scores: torch.Tensor, target_retention_ratio: float) -> float:
+    \"\"\"
+    Finds the threshold bias that achieves the target retention ratio using percentiles.
+    z = (logits + bias) > 0  => logits > -bias
+    \"\"\"
+    # Sort scores or use torch.quantile
+    # target_retention_ratio is the top fraction we want to keep
+    # e.g. 0.70 means we want top 70%. We find the 30th percentile.
+    q = 1.0 - target_retention_ratio
+    q = max(0.0, min(1.0, q))
+    threshold = torch.quantile(scores.float(), q).item()
+    return -threshold
 
 
 def main():
@@ -244,16 +270,36 @@ def main():
     if not loaded:
         print("WARNING: Checkpoint not found, evaluating with initial scorer weights.")
         
-    # 4. Sweep threshold biases to evaluate accuracy vs latency trade-off
-    biases = [0.0, -1.0, -2.0, -4.0]
+    print("\nStarting Calibration Pass (bias=0.0)...")
+    _, _, _, baseline_ret, _, _, _, _, all_scores = evaluate_model(
+        ammr, val_dl, val_features, val_data, tokenizer, is_baseline=False, threshold_bias=0.0
+    )
+    
+    target_retentions = [0.80, 0.70, 0.60, 0.50]
+    biases = [0.0]
+    calibration_data = {}
+    
+    if all_scores is not None and len(all_scores) > 0:
+        for tgt in target_retentions:
+            bias = find_best_threshold(all_scores, tgt)
+            biases.append(bias)
+            calibration_data[f"target_{tgt}"] = bias
+            print(f"Calibrated bias for {tgt*100}% retention: {bias:.4f}")
+            
+        with open("calibration.json", "w") as f:
+            json.dump(calibration_data, f, indent=4)
+        print("Saved calibration results to calibration.json")
+    else:
+        biases = [0.0, -1.0, -2.0, -4.0]
+        
     results = []
     
     print("\nStarting Adaptive Evaluation Sweep...")
     for bias in biases:
-        print(f"\n--> Evaluating AMMR at Bias: {bias}")
+        print(f"\n--> Evaluating AMMR at Bias: {bias:.4f}")
         (
             a_em, a_f1, a_lat, a_ret_ratio, a_attn_cost,
-            a_comp_red, a_peak_mem, a_spans
+            a_comp_red, a_peak_mem, a_spans, _
         ) = evaluate_model(
             ammr, val_dl, val_features, val_data, tokenizer, is_baseline=False, threshold_bias=bias
         )
