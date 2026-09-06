@@ -17,12 +17,12 @@ from src.losses import (
     calculate_hidden_state_distillation_loss
 )
 from src.utils import set_seed, print_header, save_checkpoint
-from src.metrics import compute_baseline_metrics
 
 def evaluate(student, val_dl):
     student.eval()
     total_loss = 0
     total_em = 0
+    total_f1 = 0
     count = 0
     
     with torch.no_grad():
@@ -48,14 +48,31 @@ def evaluate(student, val_dl):
             pred_end = torch.argmax(s_end, dim=1)
             
             for i in range(input_ids.size(0)):
-                em = int(pred_start[i] == start_target[i] and pred_end[i] == end_target[i])
+                s_p, e_p = pred_start[i].item(), pred_end[i].item()
+                s_t, e_t = start_target[i].item(), end_target[i].item()
+                
+                em = int(s_p == s_t and e_p == e_t)
                 total_em += em
+                
+                if s_p <= e_p and s_t <= e_t:
+                    overlap = max(0, min(e_p, e_t) - max(s_p, s_t) + 1)
+                    pred_len = e_p - s_p + 1
+                    true_len = e_t - s_t + 1
+                    if overlap == 0:
+                        f1 = 0.0
+                    else:
+                        prec = overlap / pred_len
+                        rec = overlap / true_len
+                        f1 = 2 * prec * rec / (prec + rec)
+                else:
+                    f1 = 0.0
+                total_f1 += f1
                 count += 1
                 
     student.train()
     if count == 0:
-        return 0, 0
-    return total_loss / len(val_dl), (total_em / count) * 100
+        return 0, 0, 0
+    return total_loss / len(val_dl), (total_em / count) * 100, (total_f1 / count) * 100
 
 def train(args):
     set_seed(42)
@@ -137,8 +154,8 @@ def train(args):
             start_target = batch['start_positions'].to(DEVICE)
             end_target = batch['end_positions'].to(DEVICE)
             
-            seq_len = input_ids.size(1)
-            target_budget_per_seq = 6 * seq_len * target_ratio
+            valid_tokens = attention_mask.sum().item()
+            target_budget_per_batch = valid_tokens * 6 * target_ratio
             
             with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
                 with torch.no_grad():
@@ -195,7 +212,7 @@ def train(args):
                 
                 budget_loss = calculate_lagrangian_budget_loss(
                     expected_retained, 
-                    target_budget_per_seq, 
+                    target_budget_per_batch, 
                     lagrangian_multiplier
                 )
                 
@@ -215,11 +232,11 @@ def train(args):
             scheduler.step()
             
             with torch.no_grad():
-                violation = (expected_retained - target_budget_per_seq).item()
+                violation = (expected_retained - target_budget_per_batch).item()
                 lagrangian_multiplier = max(0.0, lagrangian_multiplier + lagrangian_lr * violation)
                 
                 epoch_retention += expected_retained.item()
-                epoch_target += target_budget_per_seq
+                epoch_target += target_budget_per_batch
                 epoch_violation += violation
                 num_batches += 1
             
@@ -231,7 +248,7 @@ def train(args):
                     'QA': f"{qa_loss.item():.1f}",
                     'LogKD': f"{logit_kd_loss.item():.1f}",
                     'HidKD': f"{hidden_kd_loss.item():.1f}",
-                    'Ret': f"{expected_retained.item():.0f}/{target_budget_per_seq:.0f}",
+                    'Ret': f"{expected_retained.item():.0f}/{target_budget_per_batch:.0f}",
                     'Lam': f"{lagrangian_multiplier:.3f}",
                     'AnsSurv': f"{span_survived*100:.0f}%"
                 })
@@ -246,10 +263,10 @@ def train(args):
         print(f"  Avg Violation: {avg_violation:.1f} tokens")
         print(f"  Final Lambda: {lagrangian_multiplier:.4f}")
         
-        val_loss, val_em = evaluate(student, val_dl)
-        print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%")
+        val_loss, val_em, val_f1 = evaluate(student, val_dl)
+        print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%, F1 = {val_f1:.2f}%")
         
-        score = val_em
+        score = val_f1
         is_best = score > best_val_score
         if is_best:
             best_val_score = score
