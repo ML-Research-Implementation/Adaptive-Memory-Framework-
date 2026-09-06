@@ -93,6 +93,18 @@ def train(args):
     lagrangian_multiplier = 0.0
     lagrangian_lr = 0.05
     
+    start_epoch = 0
+    global_step = 0
+    
+    if args.resume_from and os.path.exists(args.resume_from):
+        from src.utils import load_checkpoint
+        print(f"Loading checkpoint from {args.resume_from}")
+        checkpoint = load_checkpoint(student.retention_scorers, optimizer, args.resume_from, scheduler=scheduler)
+        global_step = checkpoint.get('step', 0)
+        start_epoch = checkpoint.get('epoch', 0)
+        lagrangian_multiplier = checkpoint.get('lagrangian_multiplier', 0.0)
+        print(f"Resuming training from epoch {start_epoch}, step {global_step}")
+
     curriculum = [0.95, 0.90, 0.80, 0.70, 0.60]
     
     lambda_kd = 1.0       
@@ -101,9 +113,7 @@ def train(args):
     
     print(f"Starting training for {args.epochs} epochs ({total_steps} steps).")
     
-    global_step = 0
-    
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         target_ratio = curriculum[min(epoch, len(curriculum)-1)]
         print(f"\n[Epoch {epoch+1}/{args.epochs}] Curriculum Target: {target_ratio*100:.1f}%")
         
@@ -205,8 +215,17 @@ def train(args):
         
         val_loss, val_em = evaluate(student, val_dl)
         print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%")
-        
-        save_checkpoint(student, optimizer=optimizer, step=global_step, checkpoint_path=f"squad_checkpoint_ep{epoch+1}.pt")
+        # Save model
+        save_checkpoint(
+            student.retention_scorers, 
+            optimizer=optimizer, 
+            step=global_step, 
+            checkpoint_path=f"squad_checkpoint_ep{epoch+1}.pt",
+            scheduler_state_dict=scheduler.state_dict(),
+            epoch=epoch+1,
+            lagrangian_multiplier=lagrangian_multiplier,
+            target_ratio=target_ratio
+        )
         
     print(f"\nTraining complete.")
 
@@ -217,6 +236,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_val_samples", type=int, default=500, help="Max validation samples")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--learning_rate", type=float, default=3e-3, help="Learning rate")
+    parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
     train(args)

@@ -215,7 +215,8 @@ def save_checkpoint(
 def load_checkpoint(
     model: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
-    checkpoint_path: str
+    checkpoint_path: str,
+    scheduler=None
 ) -> dict:
     """
     Load model checkpoint.
@@ -226,6 +227,9 @@ def load_checkpoint(
     
     if optimizer is not None and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
     
     step = checkpoint.get('step', 0)
     print(f"Checkpoint loaded from {checkpoint_path} at step {step}")
