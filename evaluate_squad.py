@@ -208,10 +208,10 @@ def evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer,
     return avg_em, avg_f1, avg_latency, avg_retention_ratio, attention_cost_ratio, compute_reduction, peak_memory, span_survival_rates, all_scores
 
 def find_best_threshold(scores: torch.Tensor, target_retention_ratio: float) -> float:
-    \"\"\"
+    """
     Finds the threshold bias that achieves the target retention ratio using percentiles.
     z = (logits + bias) > 0  => logits > -bias
-    \"\"\"
+    """
     # Sort scores or use torch.quantile
     # target_retention_ratio is the top fraction we want to keep
     # e.g. 0.70 means we want top 70%. We find the 30th percentile.
