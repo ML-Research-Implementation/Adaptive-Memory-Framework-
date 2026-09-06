@@ -96,6 +96,9 @@ def train(args):
     start_epoch = 0
     global_step = 0
     
+    use_amp = (DEVICE.type == "cuda")
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    
     if args.resume_from and os.path.exists(args.resume_from):
         from src.utils import load_checkpoint
         print(f"Loading checkpoint from {args.resume_from}")
@@ -128,72 +131,80 @@ def train(args):
             seq_len = input_ids.size(1)
             target_budget_per_seq = 6 * seq_len * target_ratio
             
-            with torch.no_grad():
-                teacher_outputs = teacher.model(
-                    input_ids, 
-                    attention_mask, 
-                    output_hidden_states=True
-                )
-                t_start = teacher_outputs.start_logits
-                t_end = teacher_outputs.end_logits
-                teacher_hidden_states = teacher_outputs.hidden_states
-                
-            s_start, s_end, layer_metrics = student(
-                input_ids=input_ids, 
-                attention_mask=attention_mask,
-                return_layer_metrics=True,
-                training=True
-            )
-            
-            expected_retained = layer_metrics['expected_retained_tokens']
-            
-            final_selection = layer_metrics['selection_results'][-1]
-            if final_selection is not None:
-                final_indices = final_selection.selected_indices
-                start_kept = (final_indices == start_target.unsqueeze(1)).any(dim=1)
-                end_kept = (final_indices == end_target.unsqueeze(1)).any(dim=1)
-                span_survived = (start_kept & end_kept).float().mean().item()
-            else:
-                span_survived = 1.0
-                
-            loss_start = F.cross_entropy(s_start, start_target)
-            loss_end = F.cross_entropy(s_end, end_target)
-            qa_loss = (loss_start + loss_end) / 2
-            
-            logit_kd_loss = calculate_distillation_loss(s_start, s_end, t_start, t_end, temperature=2.0)
-            
-            hidden_kd_loss = 0.0
-            for layer_idx in range(6):
-                if layer_metrics['selection_results'][layer_idx] is not None:
-                    s_hidden = layer_metrics['hidden_states'][layer_idx]
-                    t_hidden = teacher_hidden_states[layer_idx + 1]
-                    sel_indices = layer_metrics['selection_results'][layer_idx].selected_indices
-                    att_mask = layer_metrics['selection_results'][layer_idx].new_attention_mask
-                    
-                    h_loss = calculate_hidden_state_distillation_loss(
-                        student_hidden=s_hidden,
-                        teacher_hidden=t_hidden,
-                        selected_indices=sel_indices,
-                        attention_mask=att_mask,
-                        mse_weight=1.0,
-                        cos_weight=1.0
+            with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
+                with torch.no_grad():
+                    teacher_outputs = teacher.model(
+                        input_ids, 
+                        attention_mask, 
+                        output_hidden_states=True
                     )
-                    hidden_kd_loss += h_loss
-            
-            budget_loss = calculate_lagrangian_budget_loss(
-                expected_retained, 
-                target_budget_per_seq, 
-                lagrangian_multiplier
-            )
-            
-            total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * budget_loss
+                    t_start = teacher_outputs.start_logits
+                    t_end = teacher_outputs.end_logits
+                    teacher_hidden_states = teacher_outputs.hidden_states
+                    
+                s_start, s_end, layer_metrics = student(
+                    input_ids=input_ids, 
+                    attention_mask=attention_mask,
+                    return_layer_metrics=True,
+                    training=True
+                )
+                
+                expected_retained = layer_metrics['expected_retained_tokens']
+                
+                final_selection = layer_metrics['selection_results'][-1]
+                if final_selection is not None:
+                    final_indices = final_selection.selected_indices
+                    start_kept = (final_indices == start_target.unsqueeze(1)).any(dim=1)
+                    end_kept = (final_indices == end_target.unsqueeze(1)).any(dim=1)
+                    span_survived = (start_kept & end_kept).float().mean().item()
+                else:
+                    span_survived = 1.0
+                    
+                loss_start = F.cross_entropy(s_start, start_target)
+                loss_end = F.cross_entropy(s_end, end_target)
+                qa_loss = (loss_start + loss_end) / 2
+                
+                logit_kd_loss = calculate_distillation_loss(s_start, s_end, t_start, t_end, temperature=2.0)
+                
+                hidden_kd_loss = 0.0
+                for layer_idx in range(6):
+                    if layer_metrics['selection_results'][layer_idx] is not None:
+                        s_hidden = layer_metrics['hidden_states'][layer_idx]
+                        t_hidden = teacher_hidden_states[layer_idx + 1]
+                        sel_indices = layer_metrics['selection_results'][layer_idx].selected_indices
+                        att_mask = layer_metrics['selection_results'][layer_idx].new_attention_mask
+                        
+                        h_loss = calculate_hidden_state_distillation_loss(
+                            student_hidden=s_hidden,
+                            teacher_hidden=t_hidden,
+                            selected_indices=sel_indices,
+                            attention_mask=att_mask,
+                            mse_weight=1.0,
+                            cos_weight=1.0
+                        )
+                        hidden_kd_loss += h_loss
+                
+                budget_loss = calculate_lagrangian_budget_loss(
+                    expected_retained, 
+                    target_budget_per_seq, 
+                    lagrangian_multiplier
+                )
+                
+                total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * budget_loss
             
             optimizer.zero_grad()
-            total_loss.backward()
             
-            torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=1.0)
-            
-            optimizer.step()
+            if use_amp:
+                scaler.scale(total_loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=1.0)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                total_loss.backward()
+                torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=1.0)
+                optimizer.step()
+                
             scheduler.step()
             
             with torch.no_grad():
