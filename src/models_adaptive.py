@@ -33,13 +33,14 @@ class HardConcreteGate(nn.Module):
             u = torch.rand_like(logits).clamp(1e-6, 1.0 - 1e-6)
             noise = torch.log(u) - torch.log(1.0 - u)
             s = torch.sigmoid((logits + noise) / max(self.temp, 1e-4))
-        else:
-            s = torch.sigmoid(logits + threshold_bias)
             
-        # Stretch and clamp to [0, 1]
-        s_stretched = s * (self.stretch_max - self.stretch_min) + self.stretch_min
-        z = torch.clamp(s_stretched, 0.0, 1.0)
-        
+            # Stretch and clamp to [0, 1]
+            s_stretched = s * (self.stretch_max - self.stretch_min) + self.stretch_min
+            z = torch.clamp(s_stretched, 0.0, 1.0)
+        else:
+            # Deterministic binary hard decision
+            z = (logits + threshold_bias > 0.0).float()
+            
         # Smooth surrogate probability for budget tracking
         prob = torch.sigmoid(logits).clamp(1e-6, 1.0 - 1e-6)
         
