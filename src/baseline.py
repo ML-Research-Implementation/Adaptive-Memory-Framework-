@@ -12,7 +12,7 @@ from src.utils import count_parameters, freeze_model, print_header
 from src.data import QADataLoader
 
 
-class BaselineQAModel:
+class BaselineQAModel(nn.Module):
     """
     Wrapper for baseline DistilBERT QA model.
     
@@ -37,6 +37,8 @@ class BaselineQAModel:
             device: Device for model (defaults to config.DEVICE).
             freeze_parameters: Whether to freeze all parameters (True for frozen baseline).
         """
+        super().__init__()
+        super().__init__()
         self.model_name = model_name
         self.device = device or DEVICE
         
@@ -61,6 +63,13 @@ class BaselineQAModel:
         """Get the QA model for use in training (alias for self.model)."""
         return self.model
     
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        """Forward the frozen baseline through its Hugging Face model."""
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+        return self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
+
     def get_baseline_prediction(
         self,
         input_ids: torch.Tensor,
