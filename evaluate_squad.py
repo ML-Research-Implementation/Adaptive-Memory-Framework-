@@ -221,6 +221,52 @@ def evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer,
             
     return avg_em, avg_f1, avg_latency, avg_retention_ratio, attention_cost_ratio, compute_reduction, peak_memory, span_survival_rates, all_scores
 
+def load_trained_ammr_checkpoint(model, checkpoint_path):
+    """Load a full AMMR training checkpoint for evaluation."""
+    checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
+    if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+        raise RuntimeError(
+            f"Expected full AMMR checkpoint with model_state_dict: {checkpoint_path}"
+        )
+    state_dict = checkpoint["model_state_dict"]
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(
+            f"Checkpoint model_state_dict is not a mapping: {checkpoint_path}"
+        )
+
+    scorer = model.get_retention_scorers()
+    scorer_keys = set(scorer.state_dict().keys())
+    full_model_keys = set(model.state_dict().keys())
+    state_keys = set(state_dict.keys())
+
+    if state_keys == scorer_keys:
+        scorer.load_state_dict(state_dict, strict=True)
+        structure = "retention_scorers ModuleList model_state_dict"
+    elif state_keys == full_model_keys:
+        model.load_state_dict(state_dict, strict=True)
+        structure = "full AdaptiveDistilBertQA model_state_dict"
+    elif state_keys and all(key.startswith("retention_scorers.") for key in state_keys):
+        prefixed_scorer_state = {
+            key[len("retention_scorers."):]: value
+            for key, value in state_dict.items()
+        }
+        if set(prefixed_scorer_state) != scorer_keys:
+            raise RuntimeError(
+                f"Checkpoint keys do not match AMMR model or scorer state: {checkpoint_path}"
+            )
+        scorer.load_state_dict(prefixed_scorer_state, strict=True)
+        structure = "retention_scorers-prefixed model_state_dict"
+    else:
+        raise RuntimeError(
+            f"Checkpoint keys do not match AMMR model or scorer state: {checkpoint_path}"
+        )
+
+    print(f"Loaded checkpoint: {checkpoint_path}")
+    print(f"Checkpoint keys: {sorted(checkpoint.keys())}")
+    print(f"Loaded structure: {structure} ({len(state_dict)} keys)")
+    return checkpoint
+
+
 def find_best_threshold(scores: torch.Tensor, target_retention_ratio: float) -> float:
     """
     Finds the threshold bias that achieves the target retention ratio using percentiles.
@@ -261,28 +307,12 @@ def main():
     print_header("2. ADAPTIVE MODEL SETUP")
     ammr = AdaptiveDistilBertQA(model_name=MODEL_NAME, device=DEVICE).to(DEVICE)
     
-    checkpoint_candidates = [
-        "models/layerwise_scorers_phase4.pt",
-        "squad_phase4_checkpoint.pt"
-    ]
-    
-    loaded = False
-    for ckpt in checkpoint_candidates:
-        if os.path.exists(ckpt):
-            try:
-                state_dict = torch.load(ckpt, map_location=DEVICE)
-                if hasattr(ammr, 'get_retention_scorers'):
-                    ammr.get_retention_scorers().load_state_dict(state_dict)
-                else:
-                    ammr.load_state_dict(state_dict, strict=False)
-                print(f"Successfully loaded trained scorers from: {ckpt}")
-                loaded = True
-                break
-            except Exception as e:
-                print(f"Notice: Failed loading from {ckpt} ({e}), checking next...")
-                
-    if not loaded:
-        print("WARNING: Checkpoint not found, evaluating with initial scorer weights.")
+    checkpoint_path = "squad_best_checkpoint.pt"
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"Required trained AMMR checkpoint not found: {checkpoint_path}"
+        )
+    load_trained_ammr_checkpoint(ammr, checkpoint_path)
         
     print("\nStarting Calibration Pass (bias=0.0)...")
     _, _, _, baseline_ret, _, _, _, _, all_scores = evaluate_model(
