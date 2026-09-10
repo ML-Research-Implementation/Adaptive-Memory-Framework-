@@ -1,6 +1,7 @@
 import os
 import time
 import argparse
+import sys
 import traceback
 import torch
 import torch.nn.functional as F
@@ -133,14 +134,24 @@ def train(args):
         raise
     except Exception as exc:
         failure_traceback = traceback.format_exc()
-        print("AMMR TRAINING FAILED - COMPLETE TRACEBACK", flush=True)
         traceback.print_exc()
-        finalize_report(report, time.time() - report_start_time, report_checkpoint_paths,
-                        status="failed", error=f"{type(exc).__name__}: {exc}")
-        report["failure_traceback"] = failure_traceback
-        save_report(report, report_json_path, report_text_path)
-        print(f"Partial AMMR results saved to {report_json_path} and {report_text_path}", flush=True)
-        raise
+        try:
+            try:
+                finalize_report(report, time.time() - report_start_time, report_checkpoint_paths, status="failed", error=f"{type(exc).__name__}: {exc}")
+            finally:
+                report["failure_traceback"] = failure_traceback
+                try:
+                    save_report(report, report_json_path, report_text_path)
+                except Exception as report_error:
+                    print("Failure report writing also failed:", flush=True)
+                    traceback.print_exc()
+                    report["failure_report_error"] = f"{type(report_error).__name__}: {report_error}"
+        except Exception as report_error:
+            print("Failure report finalization also failed:", flush=True)
+            traceback.print_exc()
+            report["failure_report_error"] = f"{type(report_error).__name__}: {report_error}"
+        finally:
+            raise
 
 def _train_with_report(args, report, report_json_path, report_text_path,
                        report_checkpoint_paths, report_start_time):
