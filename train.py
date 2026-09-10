@@ -1,6 +1,7 @@
 import os
 import time
 import argparse
+import traceback
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
@@ -131,12 +132,15 @@ def train(args):
         print(f"\nPartial AMMR results saved to {report_json_path} and {report_text_path}")
         raise
     except Exception as exc:
+        failure_traceback = traceback.format_exc()
+        print("AMMR TRAINING FAILED - COMPLETE TRACEBACK", flush=True)
+        traceback.print_exc()
         finalize_report(report, time.time() - report_start_time, report_checkpoint_paths,
                         status="failed", error=f"{type(exc).__name__}: {exc}")
+        report["failure_traceback"] = failure_traceback
         save_report(report, report_json_path, report_text_path)
-        print(f"\nPartial AMMR results saved to {report_json_path} and {report_text_path}")
+        print(f"Partial AMMR results saved to {report_json_path} and {report_text_path}", flush=True)
         raise
-
 
 def _train_with_report(args, report, report_json_path, report_text_path,
                        report_checkpoint_paths, report_start_time):

@@ -100,5 +100,12 @@ def finalize_report(report: Dict[str, Any], elapsed_seconds: float,
         report["error"] = error
 
 
+def record_failure(report: Dict[str, Any], traceback_text: str, error: Optional[str] = None) -> None:
+    """Attach the complete original failure traceback to a partial report."""
+    report["failure_traceback"] = traceback_text
+    if error:
+        report["error"] = error
+
+
 def final_value(item: Optional[Dict[str, Any]], key: str) -> Any:
     return item.get(key) if item else None
