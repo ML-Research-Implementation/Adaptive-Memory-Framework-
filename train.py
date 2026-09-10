@@ -41,12 +41,12 @@ def evaluate(student, val_dl):
             start_target = batch['start_positions'].to(DEVICE)
             end_target = batch['end_positions'].to(DEVICE)
             
-            s_start, s_end, _layer_metrics = unpack_student_outputs(student(
+            s_start, s_end, _ = student(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_layer_metrics=False,
                 training=False
-            ))
+            )
             
             loss_start = F.cross_entropy(s_start, start_target)
             loss_end = F.cross_entropy(s_end, end_target)
