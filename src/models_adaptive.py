@@ -109,6 +109,7 @@ class TokenSelectionResult:
         # This is the actual mask cardinality used for compaction. It is
         # intentionally separate from the scorer probabilities.
         self.actual_retained_counts: Optional[torch.Tensor] = None
+        self.actual_valid_counts: Optional[torch.Tensor] = None
         self.minimum_retention_ratio: Optional[float] = None
 
 
@@ -291,6 +292,7 @@ class TokenSelector:
             num_original=seq_len
         )
         result.actual_retained_counts = retained_counts.detach()
+        result.actual_valid_counts = valid_tokens.sum(dim=1).detach()
         result.minimum_retention_ratio = float(floor)
         return result
 
@@ -549,12 +551,11 @@ class AdaptiveDistilBertQA(nn.Module):
                 # ----------------------------------------------------
                 expected_kept = selection_result.retention_probs.sum(dim=1).mean()
                 actual_kept = selection_result.actual_retained_counts.float().mean()
+                actual_valid = selection_result.actual_valid_counts.float().mean()
 
                 layer_metrics["expected_retained_tokens"] += expected_kept
                 layer_metrics["actual_retained_tokens"] += actual_kept
-                layer_metrics["actual_original_tokens"] += torch.tensor(
-                    float(tokens_before), device=input_ids.device
-                )
+                layer_metrics["actual_original_tokens"] += actual_valid
                 layer_metrics["actual_retention_ratio"] = (
                     layer_metrics["actual_retained_tokens"]
                     / layer_metrics["actual_original_tokens"].clamp_min(1.0)
