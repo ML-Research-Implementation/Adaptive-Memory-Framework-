@@ -154,8 +154,17 @@ def train(args):
             start_target = batch['start_positions'].to(DEVICE)
             end_target = batch['end_positions'].to(DEVICE)
             
-            valid_tokens = attention_mask.sum().item()
-            target_budget_per_batch = valid_tokens * 6 * target_ratio
+            # target_budget must be in the same units as expected_retained_tokens.
+            # expected_retained_tokens accumulates mean-per-sequence values, one per
+            # active layer (6 total).  So the target must be:
+            #   avg_valid_per_seq  (mean valid tokens/seq in this batch)
+            #   × target_ratio     (fraction to retain)
+            #   × num_active_layers (6)
+            batch_size_cur = input_ids.size(0)
+            avg_valid_per_seq = attention_mask.sum().item() / batch_size_cur
+            # Number of layers that apply retention (all 6 by default).
+            n_active_layers = sum(student.apply_retention_per_layer)
+            target_budget = avg_valid_per_seq * target_ratio * n_active_layers
             
             with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
                 with torch.no_grad():
@@ -211,8 +220,8 @@ def train(args):
                         hidden_kd_loss += h_loss
                 
                 budget_loss = calculate_lagrangian_budget_loss(
-                    expected_retained, 
-                    target_budget_per_batch, 
+                    expected_retained,
+                    target_budget,
                     lagrangian_multiplier
                 )
                 
@@ -222,21 +231,28 @@ def train(args):
                 scaler.scale(total_loss).backward()
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=1.0)
+                # scaler.step() returns None when it skips the step (overflow);
+                # we must not advance the scheduler in that case.
+                scale_before = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                # Only step scheduler when the optimizer actually updated.
+                if scaler.get_scale() == scale_before:
+                    scheduler.step()
             else:
                 total_loss.backward()
                 torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=1.0)
                 optimizer.step()
-                
-            scheduler.step()
+                scheduler.step()
             
             with torch.no_grad():
-                violation = (expected_retained - target_budget_per_batch).item()
+                # violation > 0 means actual retention > target → increase λ.
+                # violation < 0 means under-budget → λ stays at / near 0.
+                violation = (expected_retained - target_budget).item()
                 lagrangian_multiplier = max(0.0, lagrangian_multiplier + lagrangian_lr * violation)
-                
+
                 epoch_retention += expected_retained.item()
-                epoch_target += target_budget_per_batch
+                epoch_target += target_budget
                 epoch_violation += violation
                 num_batches += 1
             
@@ -248,7 +264,7 @@ def train(args):
                     'QA': f"{qa_loss.item():.1f}",
                     'LogKD': f"{logit_kd_loss.item():.1f}",
                     'HidKD': f"{hidden_kd_loss.item():.1f}",
-                    'Ret': f"{expected_retained.item():.0f}/{target_budget_per_batch:.0f}",
+                    'Ret': f"{expected_retained.item():.1f}/{target_budget:.1f}",
                     'Lam': f"{lagrangian_multiplier:.3f}",
                     'AnsSurv': f"{span_survived*100:.0f}%"
                 })
