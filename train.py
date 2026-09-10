@@ -135,23 +135,12 @@ def train(args):
     except Exception as exc:
         failure_traceback = traceback.format_exc()
         traceback.print_exc()
-        try:
-            try:
-                finalize_report(report, time.time() - report_start_time, report_checkpoint_paths, status="failed", error=f"{type(exc).__name__}: {exc}")
-            finally:
-                report["failure_traceback"] = failure_traceback
-                try:
-                    save_report(report, report_json_path, report_text_path)
-                except Exception as report_error:
-                    print("Failure report writing also failed:", flush=True)
-                    traceback.print_exc()
-                    report["failure_report_error"] = f"{type(report_error).__name__}: {report_error}"
-        except Exception as report_error:
-            print("Failure report finalization also failed:", flush=True)
-            traceback.print_exc()
-            report["failure_report_error"] = f"{type(report_error).__name__}: {report_error}"
-        finally:
-            raise
+        finalize_report(report, time.time() - report_start_time, report_checkpoint_paths,
+                        status="failed", error=f"{type(exc).__name__}: {exc}")
+        report["failure_traceback"] = failure_traceback
+        save_report(report, report_json_path, report_text_path)
+        print(f"Partial AMMR results saved to {report_json_path} and {report_text_path}")
+        raise
 
 def _train_with_report(args, report, report_json_path, report_text_path,
                        report_checkpoint_paths, report_start_time):
@@ -245,6 +234,11 @@ def _train_with_report(args, report, report_json_path, report_text_path,
         epoch_val_answer_survival = 1.0
         epoch_lambda_start = lagrangian_multiplier
         epoch_raw_violation = 0.0
+        epoch_optimizer_steps = 0
+        epoch_optimizer_skips = {}
+        epoch_grad_norm_sum = 0.0
+        epoch_first_scorer_checksum = sum(parameter.detach().float().sum().item() for parameter in student.retention_scorers.parameters())
+        epoch_first_student_checksum = sum(parameter.detach().float().sum().item() for parameter in student.parameters())
 
         for batch in progress_bar:
             optimizer.zero_grad()
@@ -344,6 +338,10 @@ def _train_with_report(args, report, report_json_path, report_text_path,
             losses_stable = all(value.detach().abs().item() <= max_stable_loss for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
             warmup = epoch < scorer_warmup_epochs
             should_update_scorer = losses_finite and losses_stable and not warmup
+            skip_reasons = []
+            if not losses_finite: skip_reasons.append("non_finite_loss")
+            if not losses_stable: skip_reasons.append("unstable_loss")
+            if warmup: skip_reasons.append("warmup")
 
             if should_update_scorer:
                 if use_amp and scaler is not None:
@@ -363,15 +361,19 @@ def _train_with_report(args, report, report_json_path, report_text_path,
                 else:
                     total_loss.backward()
                     grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=0.5)
+                    epoch_grad_norm_sum += float(grad_norm.detach().item())
                     if torch.isfinite(grad_norm):
                         optimizer.step()
                         scheduler.step()
+                        epoch_optimizer_steps += 1
                     else:
                         optimizer.zero_grad(set_to_none=True)
             else:
                 # Do not let unstable gradients alter scorer logits or the
                 # scheduler. The frozen teacher/student forward remains usable.
                 optimizer.zero_grad(set_to_none=True)
+                for reason in skip_reasons or ["non_finite_or_overflow_grad"]:
+                    epoch_optimizer_skips[reason] = epoch_optimizer_skips.get(reason, 0) + 1
 
             with torch.no_grad():
                 if losses_finite and losses_stable:
@@ -413,6 +415,9 @@ def _train_with_report(args, report, report_json_path, report_text_path,
         avg_violation = epoch_violation / num_batches
         lambda_after = lagrangian_multiplier
         avg_raw_violation_ratio = epoch_raw_violation / num_batches
+        epoch_last_scorer_checksum = sum(parameter.detach().float().sum().item() for parameter in student.retention_scorers.parameters())
+        epoch_last_student_checksum = sum(parameter.detach().float().sum().item() for parameter in student.parameters())
+        print(f"  Runtime diagnostics: student={epoch_first_student_checksum:.8e}->{epoch_last_student_checksum:.8e}; scorer={epoch_first_scorer_checksum:.8e}->{epoch_last_scorer_checksum:.8e}; steps={epoch_optimizer_steps}; skips={epoch_optimizer_skips}; grad_norm_sum={epoch_grad_norm_sum:.8e}; lambda={epoch_lambda_start:.8e}->{lagrangian_multiplier:.8e}")
         
         actual_retention_pct = 100.0 * epoch_retention / max(epoch_original_tokens, 1e-8)
         target_retention_pct = target_ratio * 100.0
@@ -433,12 +438,11 @@ def _train_with_report(args, report, report_json_path, report_text_path,
         print(f"  Minimum-retention floor confirmed: {actual_retention_pct + retention_tolerance >= target_retention_pct}")
         print(f"  Avg normalized violation: {avg_violation:.6f}")
         
-        val_loss, val_em, val_f1, epoch_val_answer_survival, validation_diagnostics = evaluate(
+        val_loss, val_em, val_f1, epoch_val_answer_survival = evaluate(
             student, val_dl, val_features=val_features, val_data=val_data,
             tokenizer=tokenizer
         )
         print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%, F1 = {val_f1:.2f}%")
-        print(f"  Unique predicted answers: {validation_diagnostics["unique_predicted_answers"]}")
         epoch_result = {
             "epoch": epoch + 1,
             "curriculum_retention_target": target_ratio,
