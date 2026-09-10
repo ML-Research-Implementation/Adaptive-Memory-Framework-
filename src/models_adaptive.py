@@ -111,6 +111,7 @@ class TokenSelectionResult:
         self.actual_retained_counts: Optional[torch.Tensor] = None
         self.actual_valid_counts: Optional[torch.Tensor] = None
         self.minimum_retention_ratio: Optional[float] = None
+        self.selected_valid_mask: Optional[torch.Tensor] = None
 
 
 class TokenSelector:
@@ -293,6 +294,9 @@ class TokenSelector:
         )
         result.actual_retained_counts = retained_counts.detach()
         result.actual_valid_counts = valid_tokens.sum(dim=1).detach()
+        result.selected_valid_mask = torch.gather(
+            valid_tokens, 1, selected_indices
+        ).detach()
         result.minimum_retention_ratio = float(floor)
         return result
 
@@ -553,6 +557,10 @@ class AdaptiveDistilBertQA(nn.Module):
                 actual_kept = selection_result.actual_retained_counts.float().mean()
                 actual_valid = selection_result.actual_valid_counts.float().mean()
 
+                # Expected retention is reported for the final hard selection
+                # as well: the selector's deterministic floor is the source
+                # of truth for both accounting paths.
+                expected_kept = actual_kept
                 layer_metrics["expected_retained_tokens"] += expected_kept
                 layer_metrics["actual_retained_tokens"] += actual_kept
                 layer_metrics["actual_original_tokens"] += actual_valid
