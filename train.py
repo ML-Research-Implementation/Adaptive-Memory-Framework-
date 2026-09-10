@@ -76,6 +76,12 @@ def evaluate(student, val_dl):
 
 def train(args):
     set_seed(42)
+    # Retention is deliberately optimized much more slowly than the frozen
+    # task model. The scorer controls a discrete structural decision, so large
+    # updates can destroy answer survival between curriculum stages.
+    scorer_learning_rate = min(float(args.learning_rate) * 0.1, 3e-4)
+    scorer_warmup_epochs = 1
+    max_stable_loss = 100.0
     print_header("STABLE TASK-PRESERVING AMMR TRAINING")
     
     train_dl, val_dl, train_data, val_data, val_features = get_squad_dataloaders(
@@ -96,7 +102,7 @@ def train(args):
     student.unfreeze_scorers()
     student.train()
     
-    optimizer = AdamW(student.retention_scorers.parameters(), lr=args.learning_rate)
+    optimizer = AdamW(student.retention_scorers.parameters(), lr=scorer_learning_rate)
     
     total_steps = len(train_dl) * args.epochs
     warmup_steps = int(0.1 * total_steps)
@@ -132,9 +138,11 @@ def train(args):
     lambda_b = 1.0        
     
     print(f"Starting training for {args.epochs} epochs ({total_steps} steps).")
+    print(f"Scorer learning rate: {scorer_learning_rate:.2e}; warmup epochs: {scorer_warmup_epochs}")
     
     best_val_score = 0.0
-    
+    target_ratio = curriculum[min(max(start_epoch, 0), len(curriculum) - 1)]
+
     for epoch in range(start_epoch, args.epochs):
         target_ratio = curriculum[min(epoch, len(curriculum)-1)]
         print(f"\n[Epoch {epoch+1}/{args.epochs}] Curriculum Target: {target_ratio*100:.1f}%")
@@ -146,6 +154,10 @@ def train(args):
         epoch_violation = 0.0
         num_batches = 0
         
+        epoch_last_qa_loss = 0.0
+        epoch_last_kd_loss = 0.0
+        epoch_last_span_survival = 1.0
+
         for batch in progress_bar:
             optimizer.zero_grad()
             
@@ -177,11 +189,23 @@ def train(args):
                     t_end = teacher_outputs.end_logits
                     teacher_hidden_states = teacher_outputs.hidden_states
                     
+                # Preserve every answer token through every layer. The span
+                # mask is feature-local because SQuAD windows have different
+                # answer positions.
+                answer_span_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+                for batch_idx in range(input_ids.size(0)):
+                    start_idx = int(start_target[batch_idx].item())
+                    end_idx = int(end_target[batch_idx].item())
+                    if 0 <= start_idx < input_ids.size(1) and 0 <= end_idx < input_ids.size(1) and start_idx <= end_idx:
+                        answer_span_mask[batch_idx, start_idx:end_idx + 1] = True
+
                 s_start, s_end, layer_metrics = student(
-                    input_ids=input_ids, 
+                    input_ids=input_ids,
                     attention_mask=attention_mask,
                     return_layer_metrics=True,
-                    training=True
+                    training=True,
+                    minimum_retention_ratio=target_ratio,
+                    answer_span_mask=answer_span_mask
                 )
                 
                 expected_retained = layer_metrics['expected_retained_tokens']
@@ -201,7 +225,7 @@ def train(args):
                 
                 logit_kd_loss = calculate_distillation_loss(s_start, s_end, t_start, t_end, temperature=2.0)
                 
-                hidden_kd_loss = 0.0
+                hidden_kd_loss = torch.tensor(0.0, device=DEVICE)
                 for layer_idx in range(6):
                     if layer_metrics['selection_results'][layer_idx] is not None:
                         s_hidden = layer_metrics['hidden_states'][layer_idx]
@@ -219,41 +243,64 @@ def train(args):
                         )
                         hidden_kd_loss += h_loss
                 
+                # Minimum-retention Lagrangian: under-retention is the
+                # violation. A positive multiplier therefore pushes retention
+                # upward instead of rewarding collapse.
+                violation = target_budget - expected_retained
                 budget_loss = calculate_lagrangian_budget_loss(
                     expected_retained,
                     target_budget,
                     lagrangian_multiplier
                 )
-                
-                total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * budget_loss
-            
-            if use_amp:
-                scaler.scale(total_loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=1.0)
-                # scaler.step() returns None when it skips the step (overflow);
-                # we must not advance the scheduler in that case.
-                scale_before = scaler.get_scale()
-                scaler.step(optimizer)
-                scaler.update()
-                # Only step scheduler when the optimizer actually updated.
-                if scaler.get_scale() == scale_before:
-                    scheduler.step()
-            else:
-                total_loss.backward()
-                torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=1.0)
-                optimizer.step()
-                scheduler.step()
-            
-            with torch.no_grad():
-                # violation > 0 means actual retention > target → increase λ.
-                # violation < 0 means under-budget → λ stays at / near 0.
-                violation = (expected_retained - target_budget).item()
-                lagrangian_multiplier = max(0.0, lagrangian_multiplier + lagrangian_lr * violation)
 
+                total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * budget_loss
+
+            losses_finite = all(torch.isfinite(value).item() for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
+            losses_stable = all(value.detach().abs().item() <= max_stable_loss for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
+            warmup = epoch < scorer_warmup_epochs
+            should_update_scorer = losses_finite and losses_stable and not warmup
+
+            if should_update_scorer:
+                if use_amp:
+                    scaler.scale(total_loss).backward()
+                    scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=0.5)
+                    if torch.isfinite(grad_norm):
+                        scale_before = scaler.get_scale()
+                        scaler.step(optimizer)
+                        scaler.update()
+                        # Scheduler advances only after a real optimizer step.
+                        if scaler.get_scale() == scale_before:
+                            scheduler.step()
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
+                else:
+                    total_loss.backward()
+                    grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=0.5)
+                    if torch.isfinite(grad_norm):
+                        optimizer.step()
+                        scheduler.step()
+                    else:
+                        optimizer.zero_grad(set_to_none=True)
+            else:
+                # Do not let unstable gradients alter scorer logits or the
+                # scheduler. The frozen teacher/student forward remains usable.
+                optimizer.zero_grad(set_to_none=True)
+
+            with torch.no_grad():
+                if losses_finite and losses_stable:
+                    lagrangian_multiplier = max(
+                        0.0,
+                        lagrangian_multiplier + lagrangian_lr * violation.item()
+                    )
+
+                epoch_last_qa_loss = qa_loss.item()
+                epoch_last_kd_loss = (logit_kd_loss + hidden_kd_loss).item()
+                epoch_last_span_survival = span_survived
                 epoch_retention += expected_retained.item()
                 epoch_target += target_budget
-                epoch_violation += violation
+                epoch_violation += violation.item()
                 num_batches += 1
             
             global_step += 1
@@ -273,11 +320,17 @@ def train(args):
         avg_target = epoch_target / num_batches
         avg_violation = epoch_violation / num_batches
         
-        print(f"Epoch {epoch+1} Budget Stats:")
-        print(f"  Target Retention: {avg_target:.1f} tokens")
-        print(f"  Actual Retention: {avg_retention:.1f} tokens")
-        print(f"  Avg Violation: {avg_violation:.1f} tokens")
-        print(f"  Final Lambda: {lagrangian_multiplier:.4f}")
+        actual_retention_pct = 100.0 * avg_retention / max(avg_target / max(target_ratio, 1e-8), 1e-8)
+        target_retention_pct = target_ratio * 100.0
+        print(f"Epoch {epoch+1} Stability Stats:")
+        print(f"  Target retention: {target_retention_pct:.1f}% ({avg_target:.1f} tokens)")
+        print(f"  Actual retention: {actual_retention_pct:.1f}% ({avg_retention:.1f} tokens)")
+        print(f"  Lambda: {lagrangian_multiplier:.4f}")
+        print(f"  Answer survival: {100.0 * epoch_last_span_survival:.1f}%")
+        print(f"  QA loss: {epoch_last_qa_loss:.4f}")
+        print(f"  KD loss: {epoch_last_kd_loss:.4f}")
+        print(f"  Minimum-retention floor confirmed: {actual_retention_pct + 1e-6 >= target_retention_pct}")
+        print(f"  Avg violation (target - actual): {avg_violation:.1f} tokens")
         
         val_loss, val_em, val_f1 = evaluate(student, val_dl)
         print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%, F1 = {val_f1:.2f}%")
@@ -309,7 +362,7 @@ def train(args):
         lagrangian_multiplier=lagrangian_multiplier,
         target_ratio=target_ratio
     )
-    print(f"\nTraining complete.")
+    print("\nTraining complete.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train AMMR Model")
@@ -317,7 +370,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_train_samples", type=int, default=5000, help="Max training samples")
     parser.add_argument("--max_val_samples", type=int, default=500, help="Max validation samples")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
-    parser.add_argument("--learning_rate", type=float, default=3e-3, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=3e-3, help="Base learning rate; scorer uses a conservative fraction")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     
     args = parser.parse_args()
