@@ -17,6 +17,7 @@ from src.losses import (
     calculate_hidden_state_distillation_loss
 )
 from src.utils import set_seed, print_header, save_checkpoint
+from src.training_report import new_report, save_report, finalize_report
 
 
 def unpack_student_outputs(outputs):
@@ -98,6 +99,30 @@ def evaluate(student, val_dl):
 
 def train(args):
     set_seed(42)
+    report = new_report(args)
+    report_json_path = getattr(args, "results_json", "training_results.json")
+    report_text_path = getattr(args, "results_text", "training_results.txt")
+    report_checkpoint_paths = []
+    report_start_time = time.time()
+    try:
+        return _train_with_report(args, report, report_json_path, report_text_path,
+                                  report_checkpoint_paths, report_start_time)
+    except KeyboardInterrupt:
+        finalize_report(report, time.time() - report_start_time, report_checkpoint_paths,
+                        status="interrupted", error="Training interrupted by user")
+        save_report(report, report_json_path, report_text_path)
+        print(f"\nPartial AMMR results saved to {report_json_path} and {report_text_path}")
+        raise
+    except Exception as exc:
+        finalize_report(report, time.time() - report_start_time, report_checkpoint_paths,
+                        status="failed", error=f"{type(exc).__name__}: {exc}")
+        save_report(report, report_json_path, report_text_path)
+        print(f"\nPartial AMMR results saved to {report_json_path} and {report_text_path}")
+        raise
+
+
+def _train_with_report(args, report, report_json_path, report_text_path,
+                       report_checkpoint_paths, report_start_time):
     # Retention is deliberately optimized much more slowly than the frozen
     # task model. The scorer controls a discrete structural decision, so large
     # updates can destroy answer survival between curriculum stages.
@@ -112,6 +137,8 @@ def train(args):
         max_val_samples=args.max_val_samples
     )
     
+    report["config"]["training_examples"] = len(train_data)
+    report["config"]["validation_examples"] = len(val_data)
     print("\nInitializing Teacher (Frozen DistilBERT) and Student (AMMR)...")
     teacher = BaselineQAModel(freeze_parameters=True)
     teacher.qa_model.eval()
@@ -373,6 +400,26 @@ def train(args):
         
         val_loss, val_em, val_f1 = evaluate(student, val_dl)
         print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%, F1 = {val_f1:.2f}%")
+        epoch_result = {
+            "epoch": epoch + 1,
+            "curriculum_retention_target": target_ratio,
+            "actual_retention_percentage": actual_retention_pct,
+            "target_tokens": avg_target,
+            "actual_retained_tokens": avg_retention,
+            "retention_violation": avg_raw_violation_ratio,
+            "lambda": lagrangian_multiplier,
+            "answer_survival_percentage": 100.0 * epoch_last_span_survival,
+            "qa_loss": epoch_last_qa_loss,
+            "logit_kd_loss": logit_kd_loss.item(),
+            "hidden_state_kd_loss": hidden_kd_loss.item(),
+            "total_loss": total_loss.item(),
+            "validation_loss": val_loss,
+            "validation_em": val_em,
+            "validation_f1": val_f1,
+            "hard_retention_floor_satisfied": actual_retention_pct + retention_tolerance >= target_retention_pct,
+        }
+        report["epochs"].append(epoch_result)
+        save_report(report, report_json_path, report_text_path)
         
         score = val_f1
         is_best = score > best_val_score
@@ -388,6 +435,7 @@ def train(args):
                 lagrangian_multiplier=lagrangian_multiplier,
                 target_ratio=target_ratio
             )
+            report_checkpoint_paths.append("squad_best_checkpoint.pt")
             print(f"Saved new best checkpoint (EM: {score:.2f}%)")
             
     # Save final checkpoint
@@ -401,7 +449,22 @@ def train(args):
         lagrangian_multiplier=lagrangian_multiplier,
         target_ratio=target_ratio
     )
+    report_checkpoint_paths.append("squad_final_checkpoint.pt")
+    finalize_report(report, time.time() - report_start_time, report_checkpoint_paths)
+    save_report(report, report_json_path, report_text_path)
+    print("\nFINAL AMMR RESULTS")
+    print("=" * 80)
+    for key, value in report["summary"].items():
+        print(f"{key}: {value}")
+    print("\nEPOCH RESULTS TABLE")
+    for item in report["epochs"]:
+        print(f"Epoch {item['epoch']}: target={item['curriculum_retention_target']*100:.1f}% "
+              f"actual={item['actual_retention_percentage']:.2f}% QA={item['qa_loss']:.4f} "
+              f"LogitKD={item['logit_kd_loss']:.4f} HiddenKD={item['hidden_state_kd_loss']:.4f} "
+              f"total={item['total_loss']:.4f} val_EM={item['validation_em']:.2f} val_F1={item['validation_f1']:.2f}")
+    print(f"Results saved to {report_json_path} and {report_text_path}")
     print("\nTraining complete.")
+    return report
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train AMMR Model")
@@ -411,6 +474,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
     parser.add_argument("--learning_rate", type=float, default=3e-3, help="Base learning rate; scorer uses a conservative fraction")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
+    parser.add_argument("--results_json", type=str, default="training_results.json", help="JSON results path")
+    parser.add_argument("--results_text", type=str, default="training_results.txt", help="Text results path")
     
     args = parser.parse_args()
     train(args)
