@@ -18,6 +18,13 @@ from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from src.losses import calculate_distillation_loss, calculate_lagrangian_budget_loss, calculate_hidden_state_distillation_loss
 
+
+def unpack_student_outputs(outputs):
+    if not isinstance(outputs, tuple) or len(outputs) != 3:
+        raise RuntimeError("Adaptive student must return (start_logits, end_logits, layer_metrics)")
+    return outputs
+
+
 def train_ablation(name, lambda_kd, lambda_h, max_train_samples=5000, epochs=5):
     set_seed(42)
     print_header(f"TRAINING ABLATION: {name}")
@@ -74,7 +81,7 @@ def train_ablation(name, lambda_kd, lambda_h, max_train_samples=5000, epochs=5):
                 minimum_retention_ratio=target_ratio,
                 answer_span_mask=answer_span_mask
             )
-            expected_retained = layer_metrics['expected_retained_tokens']
+            expected_retained = layer_metrics['actual_retained_tokens']
             
             qa_loss = (F.cross_entropy(s_start, start_target) + F.cross_entropy(s_end, end_target)) / 2
             
@@ -96,8 +103,9 @@ def train_ablation(name, lambda_kd, lambda_h, max_train_samples=5000, epochs=5):
             # Minimum-retention constraint: positive violation means the
             # student retained too few tokens.
             violation = target_budget_per_seq - expected_retained
-            budget_loss = calculate_lagrangian_budget_loss(expected_retained, target_budget_per_seq, lagrangian_multiplier)
-            total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + 1.0 * budget_loss
+            violation = target_budget_per_seq - expected_retained
+            bounded_budget_loss = torch.clamp(lagrangian_multiplier * violation, min=-10.0, max=10.0)
+            total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + bounded_budget_loss
 
             losses_finite = all(torch.isfinite(value).item() for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
             losses_stable = all(value.detach().abs().item() <= 100.0 for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))

@@ -18,6 +18,15 @@ from src.losses import (
 )
 from src.utils import set_seed, print_header, save_checkpoint
 
+
+def unpack_student_outputs(outputs):
+    """Normalize the adaptive student's current three-output API."""
+    if not isinstance(outputs, tuple) or len(outputs) != 3:
+        raise RuntimeError("Adaptive student must return (start_logits, end_logits, layer_metrics)")
+    start_logits, end_logits, layer_metrics = outputs
+    return start_logits, end_logits, layer_metrics
+
+
 def evaluate(student, val_dl):
     student.eval()
     total_loss = 0
@@ -32,12 +41,12 @@ def evaluate(student, val_dl):
             start_target = batch['start_positions'].to(DEVICE)
             end_target = batch['end_positions'].to(DEVICE)
             
-            s_start, s_end = student(
+            s_start, s_end, _layer_metrics = unpack_student_outputs(student(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 return_layer_metrics=False,
                 training=False
-            )
+            ))
             
             loss_start = F.cross_entropy(s_start, start_target)
             loss_end = F.cross_entropy(s_end, end_target)
@@ -120,7 +129,7 @@ def train(args):
     global_step = 0
     
     use_amp = (DEVICE.type == "cuda")
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp) if use_amp else None
+    scaler = torch.amp.GradScaler("cuda", enabled=True) if use_amp else None
     
     if args.resume_from and os.path.exists(args.resume_from):
         from src.utils import load_checkpoint
@@ -150,6 +159,7 @@ def train(args):
         progress_bar = tqdm(train_dl, desc=f"Epoch {epoch+1}")
         
         epoch_retention = 0.0
+        epoch_original_tokens = 0.0
         epoch_target = 0.0
         epoch_violation = 0.0
         num_batches = 0
@@ -166,17 +176,10 @@ def train(args):
             start_target = batch['start_positions'].to(DEVICE)
             end_target = batch['end_positions'].to(DEVICE)
             
-            # target_budget must be in the same units as expected_retained_tokens.
-            # expected_retained_tokens accumulates mean-per-sequence values, one per
-            # active layer (6 total).  So the target must be:
-            #   avg_valid_per_seq  (mean valid tokens/seq in this batch)
-            #   × target_ratio     (fraction to retain)
-            #   × num_active_layers (6)
-            batch_size_cur = input_ids.size(0)
-            avg_valid_per_seq = attention_mask.sum().item() / batch_size_cur
-            # Number of layers that apply retention (all 6 by default).
-            n_active_layers = sum(student.apply_retention_per_layer)
-            target_budget = avg_valid_per_seq * target_ratio * n_active_layers
+            # The floor is enforced per layer against the current valid-token
+            # count. The controller target must use those same per-layer
+            # denominators rather than repeating the original sequence length.
+            target_budget = 0.0
             
             with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
                 with torch.no_grad():
@@ -208,7 +211,7 @@ def train(args):
                     answer_span_mask=answer_span_mask
                 )
                 
-                expected_retained = layer_metrics['expected_retained_tokens']
+                expected_retained = layer_metrics['actual_retained_tokens']
                 
                 final_selection = layer_metrics['selection_results'][-1]
                 if final_selection is not None:
@@ -243,17 +246,22 @@ def train(args):
                         )
                         hidden_kd_loss += h_loss
                 
+                # Build the target from the actual pre-selection token counts
+                # observed by each active layer.
+                target_budget = layer_metrics['actual_original_tokens'] * target_ratio
                 # Minimum-retention Lagrangian: under-retention is the
                 # violation. A positive multiplier therefore pushes retention
                 # upward instead of rewarding collapse.
                 violation = target_budget - expected_retained
-                budget_loss = calculate_lagrangian_budget_loss(
-                    expected_retained,
-                    target_budget,
-                    lagrangian_multiplier
+                # Keep the budget controller bounded. The hard selector floor
+                # is the source of truth; the Lagrangian is only a gentle
+                # stabilizer and must never dominate QA/KD.
+                bounded_budget_loss = torch.clamp(
+                    lagrangian_multiplier * violation,
+                    min=-10.0,
+                    max=10.0
                 )
-
-                total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * budget_loss
+                total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * bounded_budget_loss
 
             losses_finite = all(torch.isfinite(value).item() for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
             losses_stable = all(value.detach().abs().item() <= max_stable_loss for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
@@ -261,7 +269,7 @@ def train(args):
             should_update_scorer = losses_finite and losses_stable and not warmup
 
             if should_update_scorer:
-                if use_amp:
+                if use_amp and scaler is not None:
                     scaler.scale(total_loss).backward()
                     scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=0.5)
@@ -298,8 +306,9 @@ def train(args):
                 epoch_last_qa_loss = qa_loss.item()
                 epoch_last_kd_loss = (logit_kd_loss + hidden_kd_loss).item()
                 epoch_last_span_survival = span_survived
-                epoch_retention += expected_retained.item()
-                epoch_target += target_budget
+                epoch_retention += layer_metrics['actual_retained_tokens'].item()
+                epoch_original_tokens += layer_metrics['actual_original_tokens'].item()
+                epoch_target += layer_metrics['actual_original_tokens'].item() * target_ratio
                 epoch_violation += violation.item()
                 num_batches += 1
             
@@ -320,8 +329,14 @@ def train(args):
         avg_target = epoch_target / num_batches
         avg_violation = epoch_violation / num_batches
         
-        actual_retention_pct = 100.0 * avg_retention / max(avg_target / max(target_ratio, 1e-8), 1e-8)
+        actual_retention_pct = 100.0 * epoch_retention / max(epoch_original_tokens, 1e-8)
         target_retention_pct = target_ratio * 100.0
+        retention_tolerance = 0.01
+        if actual_retention_pct + retention_tolerance < target_retention_pct:
+            raise RuntimeError(
+                f"Minimum-retention floor violated in epoch {epoch + 1}: "
+                f"actual={actual_retention_pct:.2f}% target={target_retention_pct:.2f}%"
+            )
         print(f"Epoch {epoch+1} Stability Stats:")
         print(f"  Target retention: {target_retention_pct:.1f}% ({avg_target:.1f} tokens)")
         print(f"  Actual retention: {actual_retention_pct:.1f}% ({avg_retention:.1f} tokens)")
@@ -329,7 +344,7 @@ def train(args):
         print(f"  Answer survival: {100.0 * epoch_last_span_survival:.1f}%")
         print(f"  QA loss: {epoch_last_qa_loss:.4f}")
         print(f"  KD loss: {epoch_last_kd_loss:.4f}")
-        print(f"  Minimum-retention floor confirmed: {actual_retention_pct + 1e-6 >= target_retention_pct}")
+        print(f"  Minimum-retention floor confirmed: {actual_retention_pct + retention_tolerance >= target_retention_pct}")
         print(f"  Avg violation (target - actual): {avg_violation:.1f} tokens")
         
         val_loss, val_em, val_f1 = evaluate(student, val_dl)

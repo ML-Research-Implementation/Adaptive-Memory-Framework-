@@ -106,6 +106,10 @@ class TokenSelectionResult:
             if num_original > 0
             else 1.0
         )
+        # This is the actual mask cardinality used for compaction. It is
+        # intentionally separate from the scorer probabilities.
+        self.actual_retained_counts: Optional[torch.Tensor] = None
+        self.minimum_retention_ratio: Optional[float] = None
 
 
 class TokenSelector:
@@ -273,7 +277,7 @@ class TokenSelector:
             * is_retained.to(new_attention_mask.dtype)
         )
 
-        return TokenSelectionResult(
+        result = TokenSelectionResult(
             selected_indices=selected_indices,
             selected_hidden_states=selected_hidden_states,
             new_attention_mask=new_attention_mask,
@@ -282,6 +286,9 @@ class TokenSelector:
             num_selected=max_retained,
             num_original=seq_len
         )
+        result.actual_retained_counts = retained_counts.detach()
+        result.minimum_retention_ratio = float(floor)
+        return result
 
 
 class AdaptiveDistilBertQA(nn.Module):
@@ -400,7 +407,10 @@ class AdaptiveDistilBertQA(nn.Module):
             "tokens_per_layer": [],
             "retention_ratios": [],
             "selection_results": [],
-            "expected_retained_tokens": 0.0
+            "expected_retained_tokens": torch.tensor(0.0, device=input_ids.device),
+            "actual_retained_tokens": torch.tensor(0.0, device=input_ids.device),
+            "actual_original_tokens": torch.tensor(0.0, device=input_ids.device),
+            "actual_retention_ratio": 1.0
         }
 
         # ------------------------------------------------------------
@@ -533,15 +543,18 @@ class AdaptiveDistilBertQA(nn.Module):
                 # ----------------------------------------------------
                 # Expected retained tokens
                 # ----------------------------------------------------
-                expected_kept = (
-                    selection_result.retention_probs
-                    .sum(dim=1)
-                    .mean()
-                )
+                expected_kept = selection_result.retention_probs.sum(dim=1).mean()
+                actual_kept = selection_result.actual_retained_counts.float().mean()
 
-                layer_metrics[
-                    "expected_retained_tokens"
-                ] += expected_kept
+                layer_metrics["expected_retained_tokens"] += expected_kept
+                layer_metrics["actual_retained_tokens"] += actual_kept
+                layer_metrics["actual_original_tokens"] += torch.tensor(
+                    float(tokens_before), device=input_ids.device
+                )
+                layer_metrics["actual_retention_ratio"] = (
+                    layer_metrics["actual_retained_tokens"]
+                    / layer_metrics["actual_original_tokens"].clamp_min(1.0)
+                )
 
                 layer_metrics[
                     "retention_ratios"
