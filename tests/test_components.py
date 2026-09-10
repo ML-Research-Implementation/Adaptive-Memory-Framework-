@@ -120,6 +120,41 @@ class TestAdaptiveComponents(unittest.TestCase):
         for param in model.retention_scorers.parameters():
             self.assertFalse(param.requires_grad)
 
+    def test_selector_floor_at_requested_ratios_with_low_scores(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(2, self.seq_len, self.hidden_dim, device=self.device)
+        logits = torch.full((2, self.seq_len), -100.0, device=self.device)
+        protected = torch.zeros(2, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(2, self.seq_len, device=self.device)
+        attention[1, 8:] = 0
+
+        for target in (0.95, 0.80, 0.60):
+            result = selector.select_adaptive(
+                hidden, logits, protected, attention,
+                training=False, minimum_retention_ratio=target
+            )
+            self.assertIsNotNone(result.actual_retained_counts)
+            self.assertIsNotNone(result.actual_valid_counts)
+            ratios = result.actual_retained_counts.float() / result.actual_valid_counts.float().clamp_min(1.0)
+            self.assertTrue(torch.all(ratios >= target - 1e-6))
+            self.assertTrue(torch.all(result.new_attention_mask[result.new_attention_mask < 0.5] == 0))
+
+    def test_padding_positions_are_never_retained_or_counted(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        logits = torch.full((1, self.seq_len), 100.0, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(1, self.seq_len, device=self.device)
+        attention[:, 6:] = 0
+
+        result = selector.select_adaptive(
+            hidden, logits, protected, attention,
+            training=False, minimum_retention_ratio=0.95
+        )
+        self.assertEqual(result.actual_valid_counts.item(), 6)
+        self.assertLessEqual(result.actual_retained_counts.item(), 6)
+        self.assertTrue(torch.all(result.selected_indices < 6))
+
     def test_floor_holds_at_each_curriculum_target(self):
         selector = TokenSelector(device=self.device)
         hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
