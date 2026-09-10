@@ -38,14 +38,12 @@ class BaselineQAModel(nn.Module):
             freeze_parameters: Whether to freeze all parameters (True for frozen baseline).
         """
         super().__init__()
-        super().__init__()
         self.model_name = model_name
         self.device = device or DEVICE
         
         # Load pretrained model
         self.model = DistilBertForQuestionAnswering.from_pretrained(model_name)
         self.model = self.model.to(self.device)
-        self.model.eval()
         
         # Extract encoder for hidden state access
         self.encoder = self.model.distilbert
@@ -53,6 +51,7 @@ class BaselineQAModel(nn.Module):
         # Freeze parameters if requested
         if freeze_parameters:
             freeze_model(self.model)
+        self.eval()
         
         self.num_parameters = count_parameters(self.model)
         self.num_layers = 6  # DistilBERT has 6 layers
@@ -65,9 +64,6 @@ class BaselineQAModel(nn.Module):
     
     def forward(self, input_ids, attention_mask=None, **kwargs):
         """Forward the frozen baseline through its Hugging Face model."""
-        return self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-
-    def forward(self, input_ids, attention_mask=None, **kwargs):
         return self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
 
     def get_baseline_prediction(
