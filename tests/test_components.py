@@ -139,6 +139,45 @@ class TestAdaptiveComponents(unittest.TestCase):
             self.assertTrue(torch.all(ratios >= target - 1e-6))
             self.assertTrue(torch.all(result.new_attention_mask[result.new_attention_mask < 0.5] == 0))
 
+    def test_forward_hard_floor_at_95_percent(self):
+        model = AdaptiveDistilBertQA(freeze_transformer=True)
+        model.eval()
+        input_ids = torch.randint(1000, 30000, (1, 20), device=self.device)
+        input_ids[:, 0] = 101
+        input_ids[:, 19] = 102
+        attention = torch.ones(1, 20, device=self.device)
+        with torch.no_grad():
+            for scorer in model.retention_scorers:
+                for parameter in scorer.parameters():
+                    parameter.zero_()
+            _, _, metrics = model(
+                input_ids, attention,
+                return_layer_metrics=True,
+                training=False,
+                minimum_retention_ratio=0.95
+            )
+        self.assertGreaterEqual(float(metrics['actual_retention_ratio']), 0.95 - 1e-4)
+        self.assertGreaterEqual(float(metrics['expected_retained_tokens']), float(metrics['actual_retained_tokens']))
+
+    def test_forward_hard_floor_at_80_percent(self):
+        model = AdaptiveDistilBertQA(freeze_transformer=True)
+        model.eval()
+        input_ids = torch.randint(1000, 30000, (1, 20), device=self.device)
+        input_ids[:, 0] = 101
+        input_ids[:, 19] = 102
+        attention = torch.ones(1, 20, device=self.device)
+        with torch.no_grad():
+            for scorer in model.retention_scorers:
+                for parameter in scorer.parameters():
+                    parameter.zero_()
+            _, _, metrics = model(
+                input_ids, attention,
+                return_layer_metrics=True,
+                training=False,
+                minimum_retention_ratio=0.80
+            )
+        self.assertGreaterEqual(float(metrics['actual_retention_ratio']), 0.80 - 1e-4)
+
     def test_padding_positions_are_never_retained_or_counted(self):
         selector = TokenSelector(device=self.device)
         hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
