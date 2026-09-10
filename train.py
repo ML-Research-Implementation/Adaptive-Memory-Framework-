@@ -438,7 +438,7 @@ def _train_with_report(args, report, report_json_path, report_text_path,
         print(f"  Minimum-retention floor confirmed: {actual_retention_pct + retention_tolerance >= target_retention_pct}")
         print(f"  Avg normalized violation: {avg_violation:.6f}")
         
-        val_loss, val_em, val_f1, epoch_val_answer_survival = evaluate(
+        val_loss, val_em, val_f1, epoch_val_answer_survival, validation_diagnostics = evaluate(
             student, val_dl, val_features=val_features, val_data=val_data,
             tokenizer=tokenizer
         )
@@ -460,6 +460,8 @@ def _train_with_report(args, report, report_json_path, report_text_path,
             "validation_em": val_em,
             "validation_f1": val_f1,
             "hard_retention_floor_satisfied": actual_retention_pct + retention_tolerance >= target_retention_pct,
+            "validation_unique_predicted_answers": validation_diagnostics.get("unique_predicted_answers", 0),
+            "validation_prediction_examples": validation_diagnostics.get("prediction_examples", []),
         }
         report["epochs"].append(epoch_result)
         save_report(report, report_json_path, report_text_path)
