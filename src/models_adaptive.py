@@ -112,6 +112,7 @@ class TokenSelectionResult:
         self.actual_valid_counts: Optional[torch.Tensor] = None
         self.minimum_retention_ratio: Optional[float] = None
         self.selected_valid_mask: Optional[torch.Tensor] = None
+        self.selected_original_indices: Optional[torch.Tensor] = None
 
 
 class TokenSelector:
@@ -400,7 +401,8 @@ class AdaptiveDistilBertQA(nn.Module):
         training: bool = False,
         threshold_bias: float = 0.0,
         minimum_retention_ratio: Optional[float] = None,
-        answer_span_mask: Optional[torch.Tensor] = None
+        answer_span_mask: Optional[torch.Tensor] = None,
+        return_original_selection: bool = False
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -543,12 +545,14 @@ class AdaptiveDistilBertQA(nn.Module):
                     selection_result.selected_indices
                 )
 
-                # Update original-position mapping.
+                # Update original-position mapping and retain it for callers
+                # that need to measure spans after multiple compaction layers.
                 token_index_mapping = torch.gather(
                     token_index_mapping,
                     1,
                     selection_result.selected_indices
                 )
+                selection_result.selected_original_indices = token_index_mapping.detach()
 
                 # ----------------------------------------------------
                 # Expected retained tokens
@@ -683,6 +687,11 @@ class AdaptiveDistilBertQA(nn.Module):
         # ============================================================
         # Return
         # ============================================================
+
+        if return_original_selection and layer_metrics.get("selection_results"):
+            for selection_result in layer_metrics["selection_results"]:
+                if selection_result is not None and selection_result.selected_original_indices is None:
+                    selection_result.selected_original_indices = token_index_mapping.detach()
 
         if return_layer_metrics:
             return (

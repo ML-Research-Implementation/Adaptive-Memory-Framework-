@@ -18,6 +18,7 @@ from src.losses import (
 )
 from src.utils import set_seed, print_header, save_checkpoint
 from src.training_report import new_report, save_report, finalize_report
+from src.qa_metrics import evaluate_squad_predictions
 
 
 def unpack_student_outputs(outputs):
@@ -41,12 +42,13 @@ def update_retention_lambda(
     return min(maximum, max(0.0, updated)), raw_violation
 
 
-def evaluate(student, val_dl):
+def evaluate(student, val_dl, val_features=None, val_data=None, tokenizer=None):
+    was_training = student.training
     student.eval()
-    total_loss = 0
-    total_em = 0
-    total_f1 = 0
-    count = 0
+    total_loss = 0.0
+    feature_logits = []
+    total_answer_survival = 0.0
+    answer_survival_count = 0
     
     with torch.no_grad():
         for batch in tqdm(val_dl, desc="Validating"):
@@ -55,11 +57,19 @@ def evaluate(student, val_dl):
             start_target = batch['start_positions'].to(DEVICE)
             end_target = batch['end_positions'].to(DEVICE)
             
-            s_start, s_end, _ = student(
+            answer_span_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            for batch_idx in range(input_ids.size(0)):
+                start_idx = int(start_target[batch_idx].item())
+                end_idx = int(end_target[batch_idx].item())
+                if 0 <= start_idx <= end_idx < input_ids.size(1):
+                    answer_span_mask[batch_idx, start_idx:end_idx + 1] = True
+            s_start, s_end, layer_metrics = student(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                return_layer_metrics=False,
-                training=False
+                return_layer_metrics=True,
+                training=False,
+                answer_span_mask=answer_span_mask,
+                return_original_selection=True
             )
             
             loss_start = F.cross_entropy(s_start, start_target)
@@ -67,35 +77,29 @@ def evaluate(student, val_dl):
             qa_loss = (loss_start + loss_end) / 2
             total_loss += qa_loss.item()
             
-            pred_start = torch.argmax(s_start, dim=1)
-            pred_end = torch.argmax(s_end, dim=1)
-            
-            for i in range(input_ids.size(0)):
-                s_p, e_p = pred_start[i].item(), pred_end[i].item()
-                s_t, e_t = start_target[i].item(), end_target[i].item()
+            for batch_idx in range(input_ids.size(0)):
+                feature_logits.append((s_start[batch_idx].detach().cpu(), s_end[batch_idx].detach().cpu()))
+            selections = layer_metrics.get("selection_results", []) if layer_metrics else []
+            for batch_idx in range(input_ids.size(0)):
+                start_idx = int(start_target[batch_idx].item())
+                end_idx = int(end_target[batch_idx].item())
+                if not (0 <= start_idx <= end_idx < input_ids.size(1)):
+                    continue
+                survives = True
+                for selection in selections:
+                    if selection is None or selection.selected_original_indices is None:
+                        continue
+                    original = selection.selected_original_indices[batch_idx]
+                    survives = survives and bool(((original == start_idx).any() and (original == end_idx).any()).item())
+                total_answer_survival += float(survives)
+                answer_survival_count += 1
                 
-                em = int(s_p == s_t and e_p == e_t)
-                total_em += em
-                
-                if s_p <= e_p and s_t <= e_t:
-                    overlap = max(0, min(e_p, e_t) - max(s_p, s_t) + 1)
-                    pred_len = e_p - s_p + 1
-                    true_len = e_t - s_t + 1
-                    if overlap == 0:
-                        f1 = 0.0
-                    else:
-                        prec = overlap / pred_len
-                        rec = overlap / true_len
-                        f1 = 2 * prec * rec / (prec + rec)
-                else:
-                    f1 = 0.0
-                total_f1 += f1
-                count += 1
-                
-    student.train()
-    if count == 0:
-        return 0, 0, 0
-    return total_loss / len(val_dl), (total_em / count) * 100, (total_f1 / count) * 100
+    student.train(was_training)
+    if val_features is not None and val_data is not None and tokenizer is not None:
+        val_em, val_f1, _ = evaluate_squad_predictions(feature_logits, val_features, val_data, tokenizer)
+    else:
+        val_em, val_f1 = 0.0, 0.0
+    return total_loss / max(len(val_dl), 1), val_em, val_f1, (100.0 * total_answer_survival / max(answer_survival_count, 1))
 
 def train(args):
     set_seed(42)
@@ -139,6 +143,8 @@ def _train_with_report(args, report, report_json_path, report_text_path,
     
     report["config"]["training_examples"] = len(train_data)
     report["config"]["validation_examples"] = len(val_data)
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
     print("\nInitializing Teacher (Frozen DistilBERT) and Student (AMMR)...")
     teacher = BaselineQAModel(freeze_parameters=True)
     teacher.qa_model.eval()
@@ -208,6 +214,7 @@ def _train_with_report(args, report, report_json_path, report_text_path,
         epoch_last_qa_loss = 0.0
         epoch_last_kd_loss = 0.0
         epoch_last_span_survival = 1.0
+        epoch_val_answer_survival = 1.0
         epoch_lambda_start = lagrangian_multiplier
         epoch_raw_violation = 0.0
 
@@ -398,7 +405,10 @@ def _train_with_report(args, report, report_json_path, report_text_path,
         print(f"  Minimum-retention floor confirmed: {actual_retention_pct + retention_tolerance >= target_retention_pct}")
         print(f"  Avg normalized violation: {avg_violation:.6f}")
         
-        val_loss, val_em, val_f1 = evaluate(student, val_dl)
+        val_loss, val_em, val_f1, epoch_val_answer_survival = evaluate(
+            student, val_dl, val_features=val_features, val_data=val_data,
+            tokenizer=tokenizer
+        )
         print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%, F1 = {val_f1:.2f}%")
         epoch_result = {
             "epoch": epoch + 1,
@@ -408,7 +418,7 @@ def _train_with_report(args, report, report_json_path, report_text_path,
             "actual_retained_tokens": avg_retention,
             "retention_violation": avg_raw_violation_ratio,
             "lambda": lagrangian_multiplier,
-            "answer_survival_percentage": 100.0 * epoch_last_span_survival,
+            "answer_survival_percentage": epoch_val_answer_survival,
             "qa_loss": epoch_last_qa_loss,
             "logit_kd_loss": logit_kd_loss.item(),
             "hidden_state_kd_loss": hidden_kd_loss.item(),
