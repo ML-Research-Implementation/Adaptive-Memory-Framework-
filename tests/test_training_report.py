@@ -2,6 +2,9 @@ import argparse
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
+import io
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 
 from src.training_report import finalize_report, new_report, save_report
@@ -47,6 +50,24 @@ class TestTrainingReport(unittest.TestCase):
             text = Path(text_path).read_text(encoding="utf-8")
             self.assertIn("FINAL AMMR RESULTS", text)
             self.assertIn("EPOCH RESULTS", text)
+    def test_failure_traceback_is_preserved_and_reported(self):
+        import train
+        args = argparse.Namespace(epochs=1, batch_size=1, max_train_samples=1, max_val_samples=1, learning_rate=1e-3, resume_from=None, results_json="failure_test.json", results_text="failure_test.txt")
+        def fail(*unused, **unused_kwargs):
+            raise ValueError("deliberate training failure")
+        output = io.StringIO()
+        try:
+            with patch.object(train, "_train_with_report", side_effect=fail), redirect_stdout(output), redirect_stderr(output):
+                with self.assertRaisesRegex(ValueError, "deliberate training failure"):
+                    train.train(args)
+            self.assertIn("ValueError: deliberate training failure", output.getvalue())
+            report = json.loads(Path("failure_test.json").read_text(encoding="utf-8"))
+            self.assertIn("failure_traceback", report)
+            self.assertIn("ValueError: deliberate training failure", report["failure_traceback"])
+        finally:
+            for filename in ("failure_test.json", "failure_test.txt"):
+                Path(filename).unlink(missing_ok=True)
+
     def test_text_metrics_change_when_logits_change(self):
         class Tokenizer:
             def decode(self, ids, skip_special_tokens=True):
