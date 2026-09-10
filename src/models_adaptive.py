@@ -209,12 +209,16 @@ class TokenSelector:
             max_retained = 1
 
         # ------------------------------------------------------------
-        # 5. Continuous gating for gradient flow
+        # 5. Continuous gating for gradient flow.
+        # The hard keep mask above is the computational guarantee; lifting
+        # selected tokens to gate value 1 also prevents the scorer's soft
+        # signal from collapsing below the active curriculum floor.
         # ------------------------------------------------------------
-        gated_hidden = (
-            hidden_states
-            * z.unsqueeze(-1)
-        )
+        floor_gate = torch.full_like(z, float(minimum_retention_ratio))
+        floor_gate = torch.where(valid_tokens, floor_gate, torch.zeros_like(floor_gate))
+        z = torch.maximum(z, floor_gate)
+        z = torch.where(keep_mask, torch.ones_like(z), z)
+        gated_hidden = hidden_states * z.unsqueeze(-1)
 
         # ------------------------------------------------------------
         # 6. Preserve original token ordering
