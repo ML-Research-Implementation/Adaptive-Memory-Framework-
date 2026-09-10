@@ -15,6 +15,13 @@ from src.utils import print_header
 import json
 
 
+def unpack_student_outputs(outputs):
+    """Normalize the adaptive student's three-output forward contract."""
+    if not isinstance(outputs, tuple) or len(outputs) != 3:
+        raise RuntimeError("Adaptive student must return (start_logits, end_logits, layer_metrics)")
+    return outputs
+
+
 def normalize_answer(s):
     """Lower text and remove punctuation, articles and extra whitespace."""
     def remove_articles(text):
@@ -97,9 +104,13 @@ def evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer,
                 layer_metrics = None
             else:
                 # AMMR forward pass
-                start_logits, end_logits, layer_metrics = model(
-                    input_ids, attention_mask, return_layer_metrics=True, training=False, threshold_bias=threshold_bias
-                )
+                start_logits, end_logits, layer_metrics = unpack_student_outputs(model(
+                    input_ids,
+                    attention_mask,
+                    return_layer_metrics=True,
+                    training=False,
+                    threshold_bias=threshold_bias
+                ))
         end_time = time.perf_counter()
         
         total_latency += (end_time - start_time)
@@ -203,7 +214,10 @@ def evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer,
             span_survival_rates.append(100.0)
             
     # Combine retention scores if collected
-    all_scores = torch.cat(all_retention_scores).view(-1) if all_retention_scores else None
+    # Layer-wise compaction produces different sequence lengths. Flatten each
+    # batch before concatenation; this preserves the calibration metric while
+    # avoiding shape assumptions across layers/examples.
+    all_scores = torch.cat([scores.reshape(-1) for scores in all_retention_scores]) if all_retention_scores else None
             
     return avg_em, avg_f1, avg_latency, avg_retention_ratio, attention_cost_ratio, compute_reduction, peak_memory, span_survival_rates, all_scores
 

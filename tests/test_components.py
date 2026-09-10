@@ -4,6 +4,13 @@ from src.models_adaptive import HardConcreteGate, TokenSelector, AdaptiveDistilB
 from src.losses import calculate_lagrangian_budget_loss
 from config import DEVICE
 
+
+def unpack_student_outputs(outputs):
+    if not isinstance(outputs, tuple) or len(outputs) != 3:
+        raise RuntimeError("Expected the current three-output student contract")
+    start, end, layer_metrics = outputs
+    return start, end, layer_metrics
+
 class TestAdaptiveComponents(unittest.TestCase):
     
     def setUp(self):
@@ -25,6 +32,15 @@ class TestAdaptiveComponents(unittest.TestCase):
         z_eval, prob_eval = gate(logits, training=False, threshold_bias=0.0)
         self.assertTrue(((z_eval == 0.0) | (z_eval == 1.0)).all())
         
+    def test_three_output_student_contract(self):
+        start = torch.randn(2, 10)
+        end = torch.randn(2, 10)
+        metrics = {"selection_results": []}
+        unpacked_start, unpacked_end, unpacked_metrics = unpack_student_outputs((start, end, metrics))
+        self.assertIs(unpacked_start, start)
+        self.assertIs(unpacked_end, end)
+        self.assertIs(unpacked_metrics, metrics)
+
     def test_minimum_retention_floor(self):
         selector = TokenSelector(device=self.device)
         hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
@@ -38,6 +54,7 @@ class TestAdaptiveComponents(unittest.TestCase):
         )
 
         self.assertGreaterEqual(result.num_selected, 8)
+        self.assertGreaterEqual(result.retention_ratio, 0.8)
 
     def test_answer_span_tokens_are_protected(self):
         selector = TokenSelector(device=self.device)
@@ -101,6 +118,22 @@ class TestAdaptiveComponents(unittest.TestCase):
         model.freeze_scorers()
         for param in model.retention_scorers.parameters():
             self.assertFalse(param.requires_grad)
+
+    def test_floor_holds_at_each_curriculum_target(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        logits = torch.full((1, self.seq_len), -100.0, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(1, self.seq_len, device=self.device)
+        for target in (0.95, 0.90, 0.80, 0.70, 0.60):
+            result = selector.select_adaptive(
+                hidden, logits, protected, attention,
+                training=False, minimum_retention_ratio=target
+            )
+            self.assertGreaterEqual(result.retention_ratio, target)
+            self.assertIsNotNone(result.actual_retained_counts)
+            actual_ratio = result.actual_retained_counts.float().mean().item() / result.num_original
+            self.assertGreaterEqual(actual_ratio, target)
 
     def test_minimum_retention_violation_increases_lambda(self):
         """Lambda must grow when actual retention is below target."""
