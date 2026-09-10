@@ -32,7 +32,9 @@ def train_ablation(name, lambda_kd, lambda_h, max_train_samples=5000, epochs=5):
     student.unfreeze_scorers()
     student.train()
     
-    optimizer = AdamW(student.retention_scorers.parameters(), lr=3e-3)
+    # Ablations use the same conservative scorer optimization as the main
+    # training path; aggressive gate updates destabilize QA/KD objectives.
+    optimizer = AdamW(student.retention_scorers.parameters(), lr=3e-4)
     total_steps = len(train_dl) * epochs
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=int(0.1*total_steps), num_training_steps=total_steps)
     
@@ -51,6 +53,12 @@ def train_ablation(name, lambda_kd, lambda_h, max_train_samples=5000, epochs=5):
             end_target = batch['end_positions'].to(DEVICE)
             
             target_budget_per_seq = 6 * input_ids.size(1) * target_ratio
+            answer_span_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+            for batch_idx in range(input_ids.size(0)):
+                start_idx = int(start_target[batch_idx].item())
+                end_idx = int(end_target[batch_idx].item())
+                if 0 <= start_idx < input_ids.size(1) and 0 <= end_idx < input_ids.size(1) and start_idx <= end_idx:
+                    answer_span_mask[batch_idx, start_idx:end_idx + 1] = True
             
             with torch.no_grad():
                 teacher_outputs = teacher.model(input_ids, attention_mask, output_hidden_states=True)
@@ -58,7 +66,14 @@ def train_ablation(name, lambda_kd, lambda_h, max_train_samples=5000, epochs=5):
                 t_end = teacher_outputs.end_logits
                 t_hidden = teacher_outputs.hidden_states
                 
-            s_start, s_end, layer_metrics = student(input_ids, attention_mask, return_layer_metrics=True, training=True)
+            s_start, s_end, layer_metrics = student(
+                input_ids,
+                attention_mask,
+                return_layer_metrics=True,
+                training=True,
+                minimum_retention_ratio=target_ratio,
+                answer_span_mask=answer_span_mask
+            )
             expected_retained = layer_metrics['expected_retained_tokens']
             
             qa_loss = (F.cross_entropy(s_start, start_target) + F.cross_entropy(s_end, end_target)) / 2
@@ -78,17 +93,28 @@ def train_ablation(name, lambda_kd, lambda_h, max_train_samples=5000, epochs=5):
                         )
                         hidden_kd_loss += h_loss
                         
+            # Minimum-retention constraint: positive violation means the
+            # student retained too few tokens.
+            violation = target_budget_per_seq - expected_retained
             budget_loss = calculate_lagrangian_budget_loss(expected_retained, target_budget_per_seq, lagrangian_multiplier)
             total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + 1.0 * budget_loss
-            
-            optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), 1.0)
-            optimizer.step()
-            scheduler.step()
-            
+
+            losses_finite = all(torch.isfinite(value).item() for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
+            losses_stable = all(value.detach().abs().item() <= 100.0 for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
+            optimizer.zero_grad(set_to_none=True)
+            if losses_finite and losses_stable and epoch > 0:
+                total_loss.backward()
+                grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), 0.5)
+                if torch.isfinite(grad_norm):
+                    optimizer.step()
+                    # Optimizer update always precedes scheduler update.
+                    scheduler.step()
+                else:
+                    optimizer.zero_grad(set_to_none=True)
+
             with torch.no_grad():
-                lagrangian_multiplier = max(0.0, lagrangian_multiplier + lagrangian_lr * (expected_retained - target_budget_per_seq).item())
+                if losses_finite and losses_stable:
+                    lagrangian_multiplier = max(0.0, lagrangian_multiplier + lagrangian_lr * violation.item())
                 
     save_checkpoint(student, optimizer=optimizer, step=total_steps, checkpoint_path=f"ablation_{name}.pt", config={"name": name, "lambda_kd": lambda_kd, "lambda_h": lambda_h}, epochs=epochs)
     del teacher, student, optimizer, scheduler
@@ -210,7 +236,7 @@ def main(test_mode=False):
     
     # 1. Baseline
     baseline = BaselineQAModel(freeze_parameters=True)
-    b_em, b_f1, b_lat, _, _, _, b_mem, _ = evaluate_model(baseline, val_dl, val_features, val_data, tokenizer, is_baseline=True)
+    b_em, b_f1, b_lat, _, _, _, b_mem, _, _ = evaluate_model(baseline, val_dl, val_features, val_data, tokenizer, is_baseline=True)
     results.append(["Baseline", "100%", 100.0, b_em, b_f1, 0.0, 100.0, 0.0, b_mem, b_lat, [100.0]*6])
     del baseline
     
@@ -225,7 +251,7 @@ def main(test_mode=False):
         for b in budgets:
             print(f"\nEvaluating {name} at {b*100:.0f}% Budget")
             bias = calibrate_threshold(ammr, cal_dl, target_ratio=b)
-            em, f1, lat, ret, cost, comp_red, mem, span_surv = evaluate_model(ammr, val_dl, val_features, val_data, tokenizer, is_baseline=False, threshold_bias=bias)
+            em, f1, lat, ret, cost, comp_red, mem, span_surv, _ = evaluate_model(ammr, val_dl, val_features, val_data, tokenizer, is_baseline=False, threshold_bias=bias)
             drop = b_f1 - f1
             results.append([name, f"{b*100:.0f}%", ret, em, f1, drop, cost, comp_red, mem, lat, span_surv])
             

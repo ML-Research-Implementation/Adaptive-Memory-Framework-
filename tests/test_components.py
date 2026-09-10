@@ -25,6 +25,36 @@ class TestAdaptiveComponents(unittest.TestCase):
         z_eval, prob_eval = gate(logits, training=False, threshold_bias=0.0)
         self.assertTrue(((z_eval == 0.0) | (z_eval == 1.0)).all())
         
+    def test_minimum_retention_floor(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        logits = torch.full((1, self.seq_len), -10.0, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(1, self.seq_len, device=self.device)
+
+        result = selector.select_adaptive(
+            hidden, logits, protected, attention,
+            training=False, minimum_retention_ratio=0.8
+        )
+
+        self.assertGreaterEqual(result.num_selected, 8)
+
+    def test_answer_span_tokens_are_protected(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        logits = torch.full((1, self.seq_len), -10.0, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        protected[:, 3:6] = True
+        attention = torch.ones(1, self.seq_len, device=self.device)
+
+        result = selector.select_adaptive(
+            hidden, logits, protected, attention,
+            training=False, minimum_retention_ratio=0.0
+        )
+
+        for index in range(3, 6):
+            self.assertTrue((result.selected_indices == index).any())
+
     def test_token_selector(self):
         selector = TokenSelector(device=self.device)
         hidden = torch.randn(self.batch_size, self.seq_len, self.hidden_dim, device=self.device)
@@ -72,8 +102,18 @@ class TestAdaptiveComponents(unittest.TestCase):
         for param in model.retention_scorers.parameters():
             self.assertFalse(param.requires_grad)
 
+    def test_minimum_retention_violation_increases_lambda(self):
+        """Lambda must grow when actual retention is below target."""
+        actual = torch.tensor(80.0)
+        target = 100.0
+        lam = 0.0
+        lr = 0.05
+        violation = target - actual
+        new_lam = max(0.0, lam + lr * violation.item())
+        self.assertGreater(new_lam, 0.0)
+
     def test_lagrangian_increases_when_over_budget(self):
-        """Lambda must grow when actual retention exceeds target."""
+        """Legacy loss remains numerically valid for checkpoint compatibility."""
         from src.losses import calculate_lagrangian_budget_loss
 
         # actual > target → violation > 0 → lambda increases

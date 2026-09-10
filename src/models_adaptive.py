@@ -127,7 +127,8 @@ class TokenSelector:
         protected_mask: torch.Tensor,
         attention_mask: torch.Tensor,
         training: bool = True,
-        threshold_bias: float = 0.0
+        threshold_bias: float = 0.0,
+        minimum_retention_ratio: float = 0.0
     ) -> TokenSelectionResult:
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -168,14 +169,38 @@ class TokenSelector:
         )
 
         # ------------------------------------------------------------
-        # 4. Binary keep mask
+        # 4. Binary keep mask with a hard minimum-retention floor.
         # ------------------------------------------------------------
         keep_mask = z > 0
+        valid_tokens = attention_mask >= 0.5
+        protected_mask = protected_mask & valid_tokens
+
+        # The curriculum target is a floor, not a soft preference. Select the
+        # highest-scoring valid tokens until every example reaches the floor.
+        floor = max(0.0, min(1.0, float(minimum_retention_ratio)))
+        minimum_counts = torch.ceil(
+            valid_tokens.sum(dim=1).float() * floor
+        ).to(dtype=torch.long)
+        required_counts = torch.maximum(
+            minimum_counts,
+            protected_mask.sum(dim=1).to(dtype=torch.long)
+        )
+
+        for batch_idx in range(batch_size):
+            current_count = int(keep_mask[batch_idx].sum().item())
+            required_count = min(int(required_counts[batch_idx].item()), int(valid_tokens[batch_idx].sum().item()))
+            if current_count >= required_count:
+                continue
+
+            candidates = valid_tokens[batch_idx] & ~keep_mask[batch_idx]
+            candidate_indices = torch.where(candidates)[0]
+            if candidate_indices.numel() > 0:
+                needed = min(required_count - current_count, candidate_indices.numel())
+                _, order = torch.topk(retention_scores[batch_idx, candidate_indices], needed)
+                keep_mask[batch_idx, candidate_indices[order]] = True
 
         retained_counts = keep_mask.sum(dim=1)
-
-        max_retained = retained_counts.max().item()
-
+        max_retained = int(retained_counts.max().item())
         if max_retained == 0:
             max_retained = 1
 
@@ -356,7 +381,9 @@ class AdaptiveDistilBertQA(nn.Module):
         attention_mask: torch.Tensor,
         return_layer_metrics: bool = True,
         training: bool = False,
-        threshold_bias: float = 0.0
+        threshold_bias: float = 0.0,
+        minimum_retention_ratio: Optional[float] = None,
+        answer_span_mask: Optional[torch.Tensor] = None
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -382,6 +409,14 @@ class AdaptiveDistilBertQA(nn.Module):
         protected_mask = self.create_protected_mask(
             input_ids
         )
+        if answer_span_mask is not None:
+            protected_mask = protected_mask | answer_span_mask.to(
+                device=input_ids.device, dtype=torch.bool
+            )
+
+        if minimum_retention_ratio is None:
+            minimum_retention_ratio = float(self.retention_schedule[0])
+        minimum_retention_ratio = max(0.0, min(1.0, float(minimum_retention_ratio)))
 
         # ------------------------------------------------------------
         # Embeddings
@@ -466,7 +501,8 @@ class AdaptiveDistilBertQA(nn.Module):
                         protected_mask=protected_mask,
                         attention_mask=current_attention_mask,
                         training=training,
-                        threshold_bias=threshold_bias
+                        threshold_bias=threshold_bias,
+                        minimum_retention_ratio=minimum_retention_ratio
                     )
                 )
 
