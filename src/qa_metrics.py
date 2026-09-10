@@ -36,24 +36,21 @@ def squad_f1(gold: str, prediction: str) -> float:
 def decode_feature_span(tokenizer, feature: Dict, start: int, end: int) -> str:
     if end < start or start < 0 or end >= len(feature["input_ids"]):
         return ""
-    offsets = feature.get("offset_mapping")
-    if offsets and offsets[start] is not None and offsets[end] is not None:
-        context_ids = feature["input_ids"]
-        return tokenizer.decode(context_ids[start:end + 1], skip_special_tokens=True)
     return tokenizer.decode(feature["input_ids"][start:end + 1], skip_special_tokens=True)
 
 
 def evaluate_squad_predictions(logits_by_feature: Sequence[Tuple[torch.Tensor, torch.Tensor]],
                                features: Sequence[Dict], raw_examples: Iterable[Dict],
                                tokenizer) -> Tuple[float, float, List[Dict]]:
-    """Aggregate feature predictions by example and score decoded answer text."""
+    """Aggregate current feature logits by example and score decoded text."""
     examples = {example["id"]: example for example in raw_examples}
     grouped: Dict[str, List[Tuple[float, str]]] = collections.defaultdict(list)
     for (start_logits, end_logits), feature in zip(logits_by_feature, features):
         start = int(torch.argmax(start_logits).item())
         end = int(torch.argmax(end_logits).item())
         prediction = decode_feature_span(tokenizer, feature, start, end)
-        grouped[feature["example_id"]].append((float(start_logits[start] + end_logits[end]), prediction))
+        score = float(start_logits[start] + end_logits[end])
+        grouped[feature["example_id"]].append((score, prediction))
 
     exact_scores, f1_scores, details = [], [], []
     for example_id, example in examples.items():
@@ -66,6 +63,22 @@ def evaluate_squad_predictions(logits_by_feature: Sequence[Tuple[torch.Tensor, t
         f1 = max(squad_f1(answer, prediction) for answer in gold_answers)
         exact_scores.append(exact)
         f1_scores.append(f1)
-        details.append({"example_id": example_id, "prediction": prediction, "exact": exact, "f1": f1})
+        details.append({"example_id": example_id, "prediction": prediction, "exact": exact, "f1": f1,
+                        "gold_answers": gold_answers})
     count = max(len(exact_scores), 1)
     return 100.0 * sum(exact_scores) / count, 100.0 * sum(f1_scores) / count, details
+
+
+def summarize_prediction_diagnostics(details: Sequence[Dict], limit: int = 3) -> Dict:
+    """Summarize prediction diversity and representative decoded answers."""
+    return {
+        "unique_predicted_answers": len({item.get("prediction", "") for item in details}),
+        "prediction_examples": [
+            {"example_id": item.get("example_id"),
+             "prediction": item.get("prediction", ""),
+             "gold_answers": item.get("gold_answers", []),
+             "exact": item.get("exact", 0),
+             "f1": item.get("f1", 0.0)}
+            for item in list(details)[:limit]
+        ],
+    }

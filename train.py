@@ -18,7 +18,7 @@ from src.losses import (
 )
 from src.utils import set_seed, print_header, save_checkpoint
 from src.training_report import new_report, save_report, finalize_report
-from src.qa_metrics import evaluate_squad_predictions
+from src.qa_metrics import evaluate_squad_predictions, summarize_prediction_diagnostics
 
 
 def unpack_student_outputs(outputs):
@@ -99,7 +99,20 @@ def evaluate(student, val_dl, val_features=None, val_data=None, tokenizer=None):
         val_em, val_f1, _ = evaluate_squad_predictions(feature_logits, val_features, val_data, tokenizer)
     else:
         val_em, val_f1 = 0.0, 0.0
-    return total_loss / max(len(val_dl), 1), val_em, val_f1, (100.0 * total_answer_survival / max(answer_survival_count, 1))
+    diagnostics = summarize_prediction_diagnostics(details) if val_features is not None and val_data is not None and tokenizer is not None else {"unique_predicted_answers": 0, "prediction_examples": []}
+    return total_loss / max(len(val_dl), 1), val_em, val_f1, (100.0 * total_answer_survival / max(answer_survival_count, 1)), diagnostics
+
+def evaluate_frozen_baseline(model, val_dl, val_features, val_data, tokenizer):
+    model.eval()
+    logits = []
+    with torch.no_grad():
+        for batch in val_dl:
+            outputs = model.model(batch["input_ids"].to(DEVICE), batch["attention_mask"].to(DEVICE))
+            for index in range(outputs.start_logits.size(0)):
+                logits.append((outputs.start_logits[index].cpu(), outputs.end_logits[index].cpu()))
+    em, f1, details = evaluate_squad_predictions(logits, val_features, val_data, tokenizer)
+    return em, f1, summarize_prediction_diagnostics(details)
+
 
 def train(args):
     set_seed(42)
@@ -145,6 +158,11 @@ def _train_with_report(args, report, report_json_path, report_text_path,
     report["config"]["validation_examples"] = len(val_data)
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    baseline_report_model = BaselineQAModel(freeze_parameters=True)
+    baseline_em, baseline_f1, baseline_diagnostics = evaluate_frozen_baseline(baseline_report_model, val_dl, val_features, val_data, tokenizer)
+    report["baseline"] = {"validation_em": baseline_em, "validation_f1": baseline_f1, **baseline_diagnostics}
+    print(f"Baseline validation: EM={baseline_em:.2f}% F1={baseline_f1:.2f}% unique_answers={baseline_diagnostics['unique_predicted_answers']}")
+    del baseline_report_model
     print("\nInitializing Teacher (Frozen DistilBERT) and Student (AMMR)...")
     teacher = BaselineQAModel(freeze_parameters=True)
     teacher.qa_model.eval()
@@ -405,11 +423,14 @@ def _train_with_report(args, report, report_json_path, report_text_path,
         print(f"  Minimum-retention floor confirmed: {actual_retention_pct + retention_tolerance >= target_retention_pct}")
         print(f"  Avg normalized violation: {avg_violation:.6f}")
         
-        val_loss, val_em, val_f1, epoch_val_answer_survival = evaluate(
+        val_loss, val_em, val_f1, epoch_val_answer_survival, validation_diagnostics = evaluate(
             student, val_dl, val_features=val_features, val_data=val_data,
             tokenizer=tokenizer
         )
         print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%, F1 = {val_f1:.2f}%")
+        print(f"  Unique predicted answers: {validation_diagnostics['unique_predicted_answers']}")
+        for example in validation_diagnostics["prediction_examples"]:
+            print(f"  Prediction example {example['example_id']}: predicted={example['prediction']!r} gold={example.get('gold_answers', [])!r}")
         epoch_result = {
             "epoch": epoch + 1,
             "curriculum_retention_target": target_ratio,
@@ -427,6 +448,8 @@ def _train_with_report(args, report, report_json_path, report_text_path,
             "validation_em": val_em,
             "validation_f1": val_f1,
             "hard_retention_floor_satisfied": actual_retention_pct + retention_tolerance >= target_retention_pct,
+            "validation_unique_predicted_answers": validation_diagnostics["unique_predicted_answers"],
+            "validation_prediction_examples": validation_diagnostics["prediction_examples"],
         }
         report["epochs"].append(epoch_result)
         save_report(report, report_json_path, report_text_path)
@@ -446,7 +469,7 @@ def _train_with_report(args, report, report_json_path, report_text_path,
                 target_ratio=target_ratio
             )
             report_checkpoint_paths.append("squad_best_checkpoint.pt")
-            print(f"Saved new best checkpoint (EM: {score:.2f}%)")
+            print(f"Saved new best checkpoint (metric=validation_f1, value={score:.2f}%, epoch={epoch+1})")
             
     # Save final checkpoint
     save_checkpoint(
