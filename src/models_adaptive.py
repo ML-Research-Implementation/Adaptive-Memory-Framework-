@@ -142,13 +142,25 @@ class TokenSelector:
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
         # ------------------------------------------------------------
-        # 1. Compute differentiable gate
+        # 1. Compute the gate. During training, retain the historical
+        # Hard-Concrete/Gumbel relaxation so the hard forward decision has a
+        # differentiable backward path into the scorer.
         # ------------------------------------------------------------
-        z, l0_penalty = self.gate(
-            retention_scores,
-            training=training,
-            threshold_bias=threshold_bias
-        )
+        if training:
+            gate_logits = torch.stack(
+                (-retention_scores, retention_scores), dim=-1
+            )
+            gate_probs = torch.nn.functional.gumbel_softmax(
+                gate_logits, tau=self.gate.temp, hard=True, dim=-1
+            )
+            z = gate_probs[..., 1]
+            l0_penalty = torch.sigmoid(retention_scores).clamp(1e-6, 1.0 - 1e-6)
+        else:
+            z, l0_penalty = self.gate(
+                retention_scores,
+                training=False,
+                threshold_bias=threshold_bias
+            )
 
         # ------------------------------------------------------------
         # 2. Always protect [CLS] / [SEP]
