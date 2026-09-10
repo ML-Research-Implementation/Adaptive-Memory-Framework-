@@ -17,6 +17,7 @@ from transformers import DistilBertForQuestionAnswering
 
 from config import MODEL_NAME, DEVICE, HIDDEN_DIMENSION
 from src.models import RetentionScorer
+from src.baseline import BaselineQAModel
 
 
 class HardConcreteGate(nn.Module):
