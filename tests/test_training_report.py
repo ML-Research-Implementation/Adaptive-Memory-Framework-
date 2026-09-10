@@ -5,6 +5,9 @@ import unittest
 from pathlib import Path
 
 from src.training_report import finalize_report, new_report, save_report
+from src.qa_metrics import evaluate_squad_predictions
+from src.models_adaptive import TokenSelector
+import torch
 
 
 class TestTrainingReport(unittest.TestCase):
@@ -44,6 +47,41 @@ class TestTrainingReport(unittest.TestCase):
             text = Path(text_path).read_text(encoding="utf-8")
             self.assertIn("FINAL AMMR RESULTS", text)
             self.assertIn("EPOCH RESULTS", text)
+    def test_text_metrics_change_when_logits_change(self):
+        class Tokenizer:
+            def decode(self, ids, skip_special_tokens=True):
+                return {1: "alpha", 2: "beta"}.get(int(ids[0]), "")
+
+        features = [
+            {"example_id": "e1", "input_ids": [0, 1, 2], "offset_mapping": [None, (0, 5), (6, 10)]},
+        ]
+        examples = [{"id": "e1", "answers": {"text": ["alpha"]}}]
+        wrong = [(torch.tensor([0.0, 0.0, 4.0]), torch.tensor([0.0, 0.0, 4.0]))]
+        right = [(torch.tensor([0.0, 4.0, 0.0]), torch.tensor([0.0, 4.0, 0.0]))]
+        wrong_em, wrong_f1, _ = evaluate_squad_predictions(wrong, features, examples, Tokenizer())
+        right_em, right_f1, _ = evaluate_squad_predictions(right, features, examples, Tokenizer())
+        self.assertLess(wrong_em, right_em)
+        self.assertLess(wrong_f1, right_f1)
+
+    def test_answer_span_survival_uses_original_positions(self):
+        selector = TokenSelector()
+        hidden = torch.randn(1, 8, 4)
+        scores = torch.full((1, 8), -100.0)
+        protected = torch.zeros(1, 8, dtype=torch.bool)
+        protected[:, 5:7] = True
+        attention = torch.ones(1, 8)
+        result = selector.select_adaptive(hidden, scores, protected, attention, training=False,
+                                          minimum_retention_ratio=0.6)
+        self.assertTrue(torch.all(torch.isin(torch.tensor([5, 6]), result.selected_indices[0])))
+
+    def test_feature_answer_span_mapping_is_preserved(self):
+        feature = {
+            "example_id": "e1", "input_ids": [101, 11, 12, 102],
+            "offset_mapping": [None, (0, 5), (6, 10), None],
+            "sequence_ids": [None, 1, 1, None],
+        }
+        self.assertEqual(feature["offset_mapping"][1], (0, 5))
+        self.assertEqual(feature["sequence_ids"][2], 1)
 
 
 if __name__ == "__main__":

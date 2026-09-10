@@ -202,7 +202,8 @@ def prepare_validation_features(examples, tokenizer, max_length=384, doc_stride=
             "start_positions": start_positions[i],
             "end_positions": end_positions[i],
             "example_id": tokenized_examples["example_id"][i],
-            "offset_mapping": offset_mapping[i]
+            "offset_mapping": offset_mapping[i],
+            "sequence_ids": [tokenized_examples.sequence_ids(i)[j] for j in range(len(tokenized_examples["input_ids"][i]))]
         })
         
     return features
