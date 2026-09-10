@@ -27,6 +27,19 @@ def unpack_student_outputs(outputs):
     return start_logits, end_logits, layer_metrics
 
 
+def update_retention_lambda(
+    lambda_value: float,
+    actual_ratio: float,
+    target_ratio: float,
+    learning_rate: float = 0.005,
+    maximum: float = 20.0
+):
+    """Bounded dual update for a minimum-retention constraint."""
+    raw_violation = max(0.0, float(target_ratio) - float(actual_ratio))
+    updated = lambda_value + learning_rate * raw_violation
+    return min(maximum, max(0.0, updated)), raw_violation
+
+
 def evaluate(student, val_dl):
     student.eval()
     total_loss = 0
@@ -123,7 +136,8 @@ def train(args):
     )
     
     lagrangian_multiplier = 0.0
-    lagrangian_lr = 0.05
+    lagrangian_lr = 0.005
+    lagrangian_max = 20.0
     
     start_epoch = 0
     global_step = 0
@@ -167,6 +181,8 @@ def train(args):
         epoch_last_qa_loss = 0.0
         epoch_last_kd_loss = 0.0
         epoch_last_span_survival = 1.0
+        epoch_lambda_start = lagrangian_multiplier
+        epoch_raw_violation = 0.0
 
         for batch in progress_bar:
             optimizer.zero_grad()
@@ -177,9 +193,7 @@ def train(args):
             end_target = batch['end_positions'].to(DEVICE)
             
             # The floor is enforced per layer against the current valid-token
-            # count. The controller target must use those same per-layer
-            # denominators rather than repeating the original sequence length.
-            target_budget = 0.0
+            # count. The controller uses the normalized ratio directly.
             
             with torch.amp.autocast(device_type=DEVICE.type, enabled=use_amp):
                 with torch.no_grad():
@@ -210,8 +224,6 @@ def train(args):
                     minimum_retention_ratio=target_ratio,
                     answer_span_mask=answer_span_mask
                 )
-                
-                expected_retained = layer_metrics['actual_retained_tokens']
                 
                 final_selection = layer_metrics['selection_results'][-1]
                 if final_selection is not None:
@@ -248,17 +260,20 @@ def train(args):
                 
                 # Build the target from the actual pre-selection token counts
                 # observed by each active layer.
-                target_budget = layer_metrics['actual_original_tokens'] * target_ratio
                 # Minimum-retention Lagrangian: under-retention is the
                 # violation. A positive multiplier therefore pushes retention
                 # upward instead of rewarding collapse.
-                violation = target_budget - expected_retained
-                # Keep the budget controller bounded. The hard selector floor
-                # is the source of truth; the Lagrangian is only a gentle
-                # stabilizer and must never dominate QA/KD.
+                actual_ratio = layer_metrics['actual_retention_ratio']
+                raw_violation_ratio = torch.relu(
+                    torch.as_tensor(target_ratio, device=actual_ratio.device)
+                    - actual_ratio
+                )
+                # A normalized minimum-retention penalty is positive when the
+                # model is below target and therefore increases pressure to
+                # retain, never to drop more tokens.
                 bounded_budget_loss = torch.clamp(
-                    lagrangian_multiplier * violation,
-                    min=-10.0,
+                    lagrangian_multiplier * raw_violation_ratio,
+                    min=0.0,
                     max=10.0
                 )
                 total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * bounded_budget_loss
@@ -298,18 +313,24 @@ def train(args):
 
             with torch.no_grad():
                 if losses_finite and losses_stable:
-                    lagrangian_multiplier = max(
-                        0.0,
-                        lagrangian_multiplier + lagrangian_lr * violation.item()
+                    lagrangian_multiplier, raw_violation = update_retention_lambda(
+                        lagrangian_multiplier,
+                        actual_ratio=float(actual_ratio.detach().item()),
+                        target_ratio=target_ratio,
+                        learning_rate=lagrangian_lr,
+                        maximum=lagrangian_max
                     )
+                else:
+                    raw_violation = max(0.0, target_ratio - float(actual_ratio.detach().item()))
 
+                epoch_raw_violation += raw_violation
                 epoch_last_qa_loss = qa_loss.item()
                 epoch_last_kd_loss = (logit_kd_loss + hidden_kd_loss).item()
                 epoch_last_span_survival = span_survived
                 epoch_retention += layer_metrics['actual_retained_tokens'].item()
                 epoch_original_tokens += layer_metrics['actual_original_tokens'].item()
                 epoch_target += layer_metrics['actual_original_tokens'].item() * target_ratio
-                epoch_violation += violation.item()
+                epoch_violation += raw_violation
                 num_batches += 1
             
             global_step += 1
@@ -320,7 +341,7 @@ def train(args):
                     'QA': f"{qa_loss.item():.1f}",
                     'LogKD': f"{logit_kd_loss.item():.1f}",
                     'HidKD': f"{hidden_kd_loss.item():.1f}",
-                    'Ret': f"{expected_retained.item():.1f}/{target_budget:.1f}",
+                    'Ret': f"{float(actual_ratio.item()) * 100.0:.1f}%/{target_ratio * 100.0:.1f}%",
                     'Lam': f"{lagrangian_multiplier:.3f}",
                     'AnsSurv': f"{span_survived*100:.0f}%"
                 })
@@ -328,6 +349,8 @@ def train(args):
         avg_retention = epoch_retention / num_batches
         avg_target = epoch_target / num_batches
         avg_violation = epoch_violation / num_batches
+        lambda_after = lagrangian_multiplier
+        avg_raw_violation_ratio = epoch_raw_violation / num_batches
         
         actual_retention_pct = 100.0 * epoch_retention / max(epoch_original_tokens, 1e-8)
         target_retention_pct = target_ratio * 100.0
@@ -340,12 +363,13 @@ def train(args):
         print(f"Epoch {epoch+1} Stability Stats:")
         print(f"  Target retention: {target_retention_pct:.1f}% ({avg_target:.1f} tokens)")
         print(f"  Actual retention: {actual_retention_pct:.1f}% ({avg_retention:.1f} tokens)")
-        print(f"  Lambda: {lagrangian_multiplier:.4f}")
+        print(f"  Lambda: {lagrangian_multiplier:.4f} (before={epoch_lambda_start:.4f}, after={lambda_after:.4f})")
+        print(f"  Raw violation ratio: {avg_raw_violation_ratio:.6f}")
         print(f"  Answer survival: {100.0 * epoch_last_span_survival:.1f}%")
         print(f"  QA loss: {epoch_last_qa_loss:.4f}")
         print(f"  KD loss: {epoch_last_kd_loss:.4f}")
         print(f"  Minimum-retention floor confirmed: {actual_retention_pct + retention_tolerance >= target_retention_pct}")
-        print(f"  Avg violation (target - actual): {avg_violation:.1f} tokens")
+        print(f"  Avg normalized violation: {avg_violation:.6f}")
         
         val_loss, val_em, val_f1 = evaluate(student, val_dl)
         print(f"Validation - Epoch {epoch+1}: Loss = {val_loss:.4f}, EM = {val_em:.2f}%, F1 = {val_f1:.2f}%")

@@ -3,6 +3,7 @@ import unittest
 from src.models_adaptive import HardConcreteGate, TokenSelector, AdaptiveDistilBertQA
 from src.losses import calculate_lagrangian_budget_loss
 from config import DEVICE
+from train import update_retention_lambda
 
 
 def unpack_student_outputs(outputs):
@@ -137,13 +138,20 @@ class TestAdaptiveComponents(unittest.TestCase):
 
     def test_minimum_retention_violation_increases_lambda(self):
         """Lambda must grow when actual retention is below target."""
-        actual = torch.tensor(80.0)
-        target = 100.0
-        lam = 0.0
-        lr = 0.05
-        violation = target - actual
-        new_lam = max(0.0, lam + lr * violation.item())
-        self.assertGreater(new_lam, 0.0)
+        updated, violation = update_retention_lambda(0.0, 0.80, 0.95, learning_rate=0.005, maximum=20.0)
+        self.assertGreater(violation, 0.0)
+        self.assertGreater(updated, 0.0)
+
+    def test_lambda_update_is_normalized_and_bounded(self):
+        updated, violation = update_retention_lambda(19.99, 0.0, 0.95, learning_rate=0.01, maximum=20.0)
+        self.assertAlmostEqual(violation, 0.95)
+        self.assertLessEqual(updated, 20.0)
+
+    def test_minimum_retention_penalty_direction(self):
+        below = torch.clamp(2.0 * torch.relu(torch.tensor(0.95) - torch.tensor(0.80)), min=0.0, max=10.0)
+        above = torch.clamp(2.0 * torch.relu(torch.tensor(0.95) - torch.tensor(0.98)), min=0.0, max=10.0)
+        self.assertGreater(below.item(), 0.0)
+        self.assertEqual(above.item(), 0.0)
 
     def test_lagrangian_increases_when_over_budget(self):
         """Legacy loss remains numerically valid for checkpoint compatibility."""
