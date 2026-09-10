@@ -1,5 +1,7 @@
 import torch
 import unittest
+from torch.optim import AdamW
+from src.models import RetentionScorer
 from src.models_adaptive import HardConcreteGate, TokenSelector, AdaptiveDistilBertQA
 from src.losses import calculate_lagrangian_budget_loss
 from config import DEVICE
@@ -20,6 +22,34 @@ class TestAdaptiveComponents(unittest.TestCase):
         self.seq_len = 10
         self.hidden_dim = 16
         
+    def test_zero_initialized_scorer_learns_through_gumbel_gate(self):
+        torch.manual_seed(7)
+        scorer = RetentionScorer(hidden_dimension=16, dropout=0.0)
+        hidden = torch.randn(2, 5, 16)
+        scores, _ = scorer(hidden)
+        scores.retain_grad()
+        gate_logits = torch.stack((-scores, scores), dim=-1)
+        gate = torch.nn.functional.gumbel_softmax(
+            gate_logits, tau=0.5, hard=True, dim=-1
+        )
+        keep = gate[..., 1]
+        gated_hidden = hidden * keep.unsqueeze(-1)
+        loss = gated_hidden.square().mean()
+        self.assertTrue(scores.requires_grad)
+        self.assertTrue(gate.requires_grad)
+        self.assertTrue(gated_hidden.requires_grad)
+        self.assertTrue(loss.requires_grad)
+        optimizer = AdamW(scorer.parameters(), lr=1e-2)
+        optimizer.zero_grad()
+        loss.backward()
+        final_weight = scorer.network[-1].weight
+        final_bias = scorer.network[-1].bias
+        self.assertGreater(float(final_weight.grad.norm()), 0.0)
+        self.assertGreater(float(final_bias.grad.norm()), 0.0)
+        before = final_weight.detach().clone()
+        optimizer.step()
+        self.assertGreater(float((final_weight.detach() - before).abs().max()), 0.0)
+
     def test_hard_concrete_gate(self):
         gate = HardConcreteGate(temperature=0.5)
         logits = torch.randn(self.batch_size, self.seq_len, device=self.device)
