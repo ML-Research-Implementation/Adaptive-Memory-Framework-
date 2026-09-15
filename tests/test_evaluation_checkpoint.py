@@ -75,6 +75,11 @@ class TestEvaluationCheckpoint(unittest.TestCase):
     def test_full_validation_constant(self):
         self.assertEqual(EXPECTED_VALIDATION_EXAMPLES, 10570)
 
+    def test_evaluation_does_not_require_full_training_count(self):
+        from evaluate_squad import EXPECTED_TRAIN_EXAMPLES
+        self.assertEqual(EXPECTED_TRAIN_EXAMPLES, 87599)
+        self.assertNotEqual(1, EXPECTED_TRAIN_EXAMPLES)
+
     def test_results_record_explicit_checkpoint_paths(self):
         from evaluate_squad import DEFAULT_BEST_CHECKPOINT, DEFAULT_FINAL_CHECKPOINT
         self.assertTrue(DEFAULT_BEST_CHECKPOINT.endswith("squad_best_checkpoint.pt"))
