@@ -38,7 +38,9 @@ class RetentionScorer(nn.Module):
             nn.Linear(self.intermediate_dimension, 1)
         )
         
-        nn.init.zeros_(self.network[-1].weight)
+        # Small neutral initialization keeps sigmoid(score) near 0.5 while
+        # ensuring the scorer has a usable output signal from the first step.
+        nn.init.normal_(self.network[-1].weight, mean=0.0, std=1e-3)
         nn.init.zeros_(self.network[-1].bias)
     
     def forward(

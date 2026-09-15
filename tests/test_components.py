@@ -5,7 +5,7 @@ from src.models import RetentionScorer
 from src.models_adaptive import HardConcreteGate, TokenSelector, AdaptiveDistilBertQA
 from src.losses import calculate_lagrangian_budget_loss
 from config import DEVICE
-from train import update_retention_lambda
+from train import update_retention_lambda, activate_retention_lambda
 
 
 def unpack_student_outputs(outputs):
@@ -49,6 +49,38 @@ class TestAdaptiveComponents(unittest.TestCase):
         before = final_weight.detach().clone()
         optimizer.step()
         self.assertGreater(float((final_weight.detach() - before).abs().max()), 0.0)
+
+    def test_training_selector_keeps_soft_differentiable_full_sequence(self):
+        torch.manual_seed(11)
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(2, self.seq_len, self.hidden_dim, device=self.device, requires_grad=True)
+        scores = torch.randn(2, self.seq_len, device=self.device, requires_grad=True)
+        protected = torch.zeros(2, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(2, self.seq_len, device=self.device)
+        result = selector.select_adaptive(hidden, scores, protected, attention, training=True, minimum_retention_ratio=0.8)
+        loss = result.selected_hidden_states.square().mean()
+        self.assertEqual(result.selected_hidden_states.shape, hidden.shape)
+        self.assertTrue(result.differentiable_training)
+        self.assertTrue(result.selected_hidden_states.requires_grad)
+        self.assertTrue(result.retention_probs.requires_grad)
+        self.assertTrue(result.soft_retention_ratio.requires_grad)
+        loss.backward()
+        self.assertGreater(float(scores.grad.abs().sum()), 0.0)
+
+    def test_training_budget_ratio_is_differentiable_and_floor_is_inference_only(self):
+        torch.manual_seed(19)
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(2, self.seq_len, self.hidden_dim, device=self.device)
+        scores = torch.randn(2, self.seq_len, device=self.device, requires_grad=True)
+        protected = torch.zeros(2, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(2, self.seq_len, device=self.device)
+        result = selector.select_adaptive(hidden, scores, protected, attention, training=True, minimum_retention_ratio=0.8)
+        budget_loss = torch.relu(torch.tensor(0.9, device=self.device) - result.soft_retention_ratio)
+        budget_loss.backward()
+        self.assertTrue(result.soft_retention_ratio.requires_grad)
+        self.assertGreater(float(scores.grad.abs().sum()), 0.0)
+        self.assertTrue(result.differentiable_training)
+        self.assertEqual(result.selected_hidden_states.shape, hidden.shape)
 
     def test_hard_concrete_gate(self):
         gate = HardConcreteGate(temperature=0.5)
@@ -240,6 +272,44 @@ class TestAdaptiveComponents(unittest.TestCase):
             actual_ratio = result.actual_retained_counts.float().mean().item() / result.num_original
             self.assertGreaterEqual(actual_ratio, target)
 
+    def test_lambda_activates_before_first_violating_update(self):
+        updated, violation = activate_retention_lambda(0.0, 0.80, 0.95)
+        self.assertGreater(violation, 0.0)
+        self.assertGreater(updated, 0.0)
+
+    def test_lambda_stays_zero_at_or_above_floor(self):
+        at_floor, at_violation = activate_retention_lambda(0.0, 0.95, 0.95)
+        above_floor, above_violation = activate_retention_lambda(0.0, 0.98, 0.95)
+        self.assertEqual(at_violation, 0.0)
+        self.assertEqual(above_violation, 0.0)
+        self.assertEqual(at_floor, 0.0)
+        self.assertEqual(above_floor, 0.0)
+
+    def test_lambda_persists_and_schedule_change_does_not_reset_state(self):
+        first, _ = activate_retention_lambda(0.0, 0.80, 0.95)
+        second, _ = activate_retention_lambda(first, 0.80, 0.90)
+        self.assertGreater(first, 0.0)
+        self.assertGreater(second, first)
+
+    def test_lambda_activation_is_detached_scalar_and_bounded(self):
+        ratio = torch.tensor(0.80, device=self.device, requires_grad=True)
+        updated, _ = activate_retention_lambda(19.99, float(ratio.detach().item()), 0.95, maximum=20.0)
+        self.assertIsInstance(updated, float)
+        self.assertLessEqual(updated, 20.0)
+        self.assertIsNone(ratio.grad)
+
+    def test_budget_gradient_is_zero_at_zero_lambda_and_nonzero_when_active(self):
+        scores = torch.zeros(1, self.seq_len, device=self.device, requires_grad=True)
+        expected = torch.sigmoid(scores).mean()
+        violation = torch.relu(torch.tensor(0.95, device=self.device) - expected)
+        zero_budget = 0.0 * violation
+        zero_budget.backward(retain_graph=True)
+        self.assertEqual(float(scores.grad.abs().sum()), 0.0)
+        scores.grad = None
+        active_budget = activate_retention_lambda(0.0, 0.80, 0.95)[0] * violation
+        active_budget.backward()
+        self.assertGreater(float(scores.grad.abs().sum()), 0.0)
+
     def test_minimum_retention_violation_increases_lambda(self):
         """Lambda must grow when actual retention is below target."""
         updated, violation = update_retention_lambda(0.0, 0.80, 0.95, learning_rate=0.005, maximum=20.0)
@@ -314,6 +384,78 @@ class TestAdaptiveComponents(unittest.TestCase):
         ratio = simulated_expected / target_budget
         self.assertLess(ratio, 10.0, "Target and actual must be same order of magnitude")
         self.assertGreater(ratio, 0.1, "Target and actual must be same order of magnitude")
+
+    def test_qa_logits_scatter_start_and_end_preserves_original_positions(self):
+        mapping = torch.tensor([[0, 2, 4, 5]], device=self.device)
+        compact_start = torch.tensor([[0.5, 9.0, 3.0, 2.0]], device=self.device)
+        compact_end = torch.tensor([[0.2, 8.0, 4.0, 1.0]], device=self.device)
+        start = torch.full((1, 6), -100.0, device=self.device)
+        end = torch.full((1, 6), -100.0, device=self.device)
+        start.scatter_(1, mapping, compact_start)
+        end.scatter_(1, mapping, compact_end)
+        self.assertEqual(int(start.argmax(dim=1).item()), 2)
+        self.assertEqual(int(end.argmax(dim=1).item()), 2)
+        self.assertEqual(float(start[0, 1].item()), -100.0)
+        self.assertEqual(float(start[0, 3].item()), -100.0)
+        self.assertEqual(float(end[0, 1].item()), -100.0)
+        self.assertEqual(float(end[0, 3].item()), -100.0)
+
+    def test_qa_scatter_dropped_and_padding_positions_cannot_win(self):
+        mapping = torch.tensor([[0, 2, 4, 5]], device=self.device)
+        compact_start = torch.tensor([[1.0, 2.0, 1000.0, 3.0]], device=self.device)
+        compact_end = torch.tensor([[1.0, 2.0, 1000.0, 3.0]], device=self.device)
+        start = torch.full((1, 8), -100.0, device=self.device)
+        end = torch.full((1, 8), -100.0, device=self.device)
+        start.scatter_(1, mapping, compact_start)
+        end.scatter_(1, mapping, compact_end)
+        self.assertEqual(int(start.argmax(dim=1).item()), 4)
+        self.assertEqual(int(end.argmax(dim=1).item()), 4)
+        self.assertNotIn(int(start.argmax(dim=1).item()), {1, 3, 6, 7})
+        self.assertNotIn(int(end.argmax(dim=1).item()), {1, 3, 6, 7})
+
+    def test_qa_scatter_allows_cls_sep_and_arbitrary_retained_order(self):
+        mapping = torch.tensor([[5, 0, 4, 2]], device=self.device)
+        compact_start = torch.tensor([[1.0, 9.0, 2.0, 3.0]], device=self.device)
+        compact_end = torch.tensor([[1.0, 2.0, 9.0, 3.0]], device=self.device)
+        start = torch.full((1, 6), -100.0, device=self.device)
+        end = torch.full((1, 6), -100.0, device=self.device)
+        start.scatter_(1, mapping, compact_start)
+        end.scatter_(1, mapping, compact_end)
+        self.assertEqual(int(start.argmax(dim=1).item()), 0)
+        self.assertEqual(int(end.argmax(dim=1).item()), 4)
+        self.assertGreater(float(start[0, 0]), float(start[0, 2]))
+        self.assertGreater(float(end[0, 4]), float(end[0, 2]))
+
+    def test_normal_inference_without_answer_span_mask(self):
+        model = AdaptiveDistilBertQA(freeze_transformer=True, device=self.device)
+        model.eval()
+        input_ids = torch.randint(1000, 30000, (1, 8), device=self.device)
+        input_ids[:, 0] = 101
+        input_ids[:, -1] = 102
+        attention = torch.ones(1, 8, device=self.device)
+        with torch.no_grad():
+            start, end, metrics = model(
+                input_ids, attention, return_layer_metrics=True,
+                training=False, minimum_retention_ratio=0.0,
+                answer_span_mask=None
+            )
+        self.assertEqual(start.shape, (1, 8))
+        self.assertEqual(end.shape, (1, 8))
+        self.assertIsNotNone(metrics)
+
+    def test_oracle_answer_span_protection_is_distinct_from_normal(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        scores = torch.full((1, self.seq_len), -10.0, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(1, self.seq_len, device=self.device)
+        normal = selector.select_adaptive(hidden, scores, protected, attention, training=False)
+        oracle_protected = protected.clone()
+        oracle_protected[:, 3:5] = True
+        oracle = selector.select_adaptive(hidden, scores, oracle_protected, attention, training=False)
+        self.assertFalse(bool((normal.selected_indices == 3).any().item()))
+        self.assertTrue(bool((oracle.selected_indices == 3).any().item()))
+        self.assertTrue(bool((oracle.selected_indices == 4).any().item()))
 
     def test_scheduler_not_stepped_on_amp_overflow(self):
         """
