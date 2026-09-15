@@ -47,7 +47,8 @@ class TestEvaluationCheckpoint(unittest.TestCase):
             torch.save(self.make_checkpoint(), path)
             loaded = load_ammr_checkpoint(model, path)
         self.assertIn("model_state_dict", loaded)
-        self.assertTrue(torch.equal(model.loaded["0.weight"], torch.tensor([2.0])))
+        expected = torch.tensor([2.0], device=model.loaded["0.weight"].device)
+        self.assertTrue(torch.equal(model.loaded["0.weight"], expected))
         self.assertTrue(model.strict)
 
     def test_missing_checkpoint_refuses_initial_scorer_fallback(self):
