@@ -43,6 +43,27 @@ def update_retention_lambda(
     return min(maximum, max(0.0, updated)), raw_violation
 
 
+def activate_retention_lambda(
+    lambda_value: float,
+    expected_ratio: float,
+    target_ratio: float,
+    learning_rate: float = 0.005,
+    maximum: float = 20.0
+):
+    """Activate the dual variable before a violating scorer update.
+
+    This preserves lambda as a detached, stateful dual variable. A positive
+    initial violation receives the existing dual step before the current loss
+    is built, so the first scorer update is subject to the retention floor.
+    Subsequent batches retain and update the resulting state normally.
+    """
+    violation = max(0.0, float(target_ratio) - float(expected_ratio))
+    if violation <= 0.0:
+        return min(maximum, max(0.0, float(lambda_value))), violation
+    activated = float(lambda_value) + learning_rate * violation
+    return min(maximum, max(0.0, activated)), violation
+
+
 def evaluate(student, val_dl, val_features=None, val_data=None, tokenizer=None):
     was_training = student.training
     student.eval()
@@ -320,9 +341,29 @@ def _train_with_report(args, report, report_json_path, report_text_path,
                 # violation. A positive multiplier therefore pushes retention
                 # upward instead of rewarding collapse.
                 actual_ratio = layer_metrics['actual_retention_ratio']
+                soft_ratios = [
+                    result.soft_retention_ratio
+                    for result in layer_metrics['selection_results']
+                    if result is not None and hasattr(result, 'soft_retention_ratio')
+                ]
+                expected_ratio = (
+                    torch.stack(soft_ratios).mean()
+                    if soft_ratios else actual_ratio
+                )
+                # Activate the detached dual variable before constructing the
+                # current loss. This is a pre-optimization dual warm start for
+                # the first violating batch; the post-step update below keeps
+                # the existing stateful dual rule for future batches.
+                lagrangian_multiplier, activation_violation = activate_retention_lambda(
+                    lagrangian_multiplier,
+                    expected_ratio=float(expected_ratio.detach().item()),
+                    target_ratio=target_ratio,
+                    learning_rate=lagrangian_lr,
+                    maximum=lagrangian_max
+                )
                 raw_violation_ratio = torch.relu(
-                    torch.as_tensor(target_ratio, device=actual_ratio.device)
-                    - actual_ratio
+                    torch.as_tensor(target_ratio, device=expected_ratio.device)
+                    - expected_ratio
                 )
                 # A normalized minimum-retention penalty is positive when the
                 # model is below target and therefore increases pressure to
@@ -379,7 +420,7 @@ def _train_with_report(args, report, report_json_path, report_text_path,
                 if losses_finite and losses_stable:
                     lagrangian_multiplier, raw_violation = update_retention_lambda(
                         lagrangian_multiplier,
-                        actual_ratio=float(actual_ratio.detach().item()),
+                        actual_ratio=float(expected_ratio.detach().item()),
                         target_ratio=target_ratio,
                         learning_rate=lagrangian_lr,
                         maximum=lagrangian_max

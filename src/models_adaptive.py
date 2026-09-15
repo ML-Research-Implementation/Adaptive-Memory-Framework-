@@ -142,19 +142,13 @@ class TokenSelector:
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
         # ------------------------------------------------------------
-        # 1. Compute the gate. During training, retain the historical
-        # Hard-Concrete/Gumbel relaxation so the hard forward decision has a
-        # differentiable backward path into the scorer.
+        # 1. Training keeps the original sequence length and uses the
+        # differentiable retention probability directly. Hard compaction is
+        # reserved for deterministic inference/evaluation.
         # ------------------------------------------------------------
         if training:
-            gate_logits = torch.stack(
-                (-retention_scores, retention_scores), dim=-1
-            )
-            gate_probs = torch.nn.functional.gumbel_softmax(
-                gate_logits, tau=self.gate.temp, hard=True, dim=-1
-            )
-            z = gate_probs[..., 1]
-            l0_penalty = torch.sigmoid(retention_scores).clamp(1e-6, 1.0 - 1e-6)
+            z = torch.sigmoid(retention_scores / max(self.gate.temp, 1e-4))
+            l0_penalty = z.clamp(1e-6, 1.0 - 1e-6)
         else:
             z, l0_penalty = self.gate(
                 retention_scores,
@@ -188,12 +182,39 @@ class TokenSelector:
             l0_penalty
         )
 
-        # ------------------------------------------------------------
-        # 4. Binary keep mask with a hard minimum-retention floor.
-        # ------------------------------------------------------------
-        keep_mask = z > 0
         valid_tokens = attention_mask >= 0.5
         protected_mask = protected_mask & valid_tokens
+
+        if training:
+            # Differentiable full-sequence training path. Protected tokens are
+            # fixed at one; padding is fixed at zero; no hard indices/gather.
+            z = torch.where(protected_mask, torch.ones_like(z), z)
+            z = torch.where(valid_tokens, z, torch.zeros_like(z))
+            gated_hidden = hidden_states * z.unsqueeze(-1)
+            result = TokenSelectionResult(
+                selected_indices=torch.arange(seq_len, device=hidden_states.device).unsqueeze(0).expand(batch_size, -1),
+                selected_hidden_states=gated_hidden,
+                new_attention_mask=attention_mask,
+                retention_scores=retention_scores,
+                retention_probs=l0_penalty,
+                num_selected=seq_len,
+                num_original=seq_len,
+            )
+            result.actual_retained_counts = valid_tokens.sum(dim=1)
+            result.actual_valid_counts = valid_tokens.sum(dim=1)
+            result.selected_valid_mask = valid_tokens
+            result.minimum_retention_ratio = float(max(0.0, min(1.0, float(minimum_retention_ratio))))
+            result.differentiable_training = True
+            result.soft_retention_ratio = (
+                (l0_penalty * valid_tokens.to(l0_penalty.dtype)).sum(dim=1)
+                / valid_tokens.sum(dim=1).clamp_min(1).to(l0_penalty.dtype)
+            ).mean()
+            return result
+
+        # ------------------------------------------------------------
+        # 4. Deterministic binary keep mask with a hard minimum-retention floor.
+        # ------------------------------------------------------------
+        keep_mask = z > 0
 
         # The curriculum target is a floor, not a soft preference. Select the
         # highest-scoring valid tokens until every example reaches the floor.
@@ -312,6 +333,7 @@ class TokenSelector:
             valid_tokens, 1, selected_indices
         ).detach()
         result.minimum_retention_ratio = float(floor)
+        result.differentiable_training = False
         return result
 
 
