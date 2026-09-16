@@ -1,23 +1,16 @@
 """Diagnostic-only AMMR budget coefficient sweep.
 
-This script never trains the production model, writes checkpoints, or changes
-production source. It loads one real SQuAD validation batch and evaluates
-temporary loss coefficients on cloned scorer/model state.
-
-Example (Colab):
-    python diagnose_budget_coefficient_sweep.py \
-      --checkpoint /content/drive/MyDrive/ML-Research/AMMR_DIAGNOSTIC_EPOCH5_CHECKPOINT.pt \
-      --batch-size 1
+No production model parameters are updated and no checkpoint is written. Every
+loss component and every alpha uses a fresh student forward/autograd graph.
 """
 
 import argparse
 import copy
 import os
-from typing import Dict, Iterable, List
+from typing import Dict, List
 
 import torch
 import torch.nn.functional as F
-from torch.optim import AdamW
 
 from config import DEVICE, MODEL_NAME
 from evaluate_squad import load_ammr_checkpoint
@@ -27,7 +20,7 @@ from src.models_adaptive import AdaptiveDistilBertQA
 from src.squad_data import get_squad_dataloaders
 
 ALPHAS = (1, 10, 100, 1000, 10000)
-EPSILON = 1e-8
+EPSILON = 1e-12
 
 
 def build_parser():
@@ -37,7 +30,7 @@ def build_parser():
     parser.add_argument("--target-ratio", type=float, default=None)
     parser.add_argument("--num-examples", type=int, default=1)
     parser.add_argument("--learning-rate", type=float, default=3e-4,
-                        help="Temporary cloned-model diagnostic step size")
+                        help="Temporary diagnostic step size; production scorer LR is reported separately")
     return parser
 
 
@@ -49,190 +42,215 @@ def _zero_grads(model):
 def _layer_grad_stats(model) -> List[Dict[str, float]]:
     rows = []
     for layer, scorer in enumerate(model.retention_scorers):
-        grads = [p.grad.detach().float().reshape(-1) for p in scorer.parameters() if p.grad is not None]
-        if grads:
-            values = torch.cat(grads)
-            norm = float(values.norm().item())
-            mean = float(values.mean().item())
-            minimum = float(values.min().item())
-            maximum = float(values.max().item())
-        else:
-            norm = mean = minimum = maximum = 0.0
+        values = [p.grad.detach().float().reshape(-1) for p in scorer.parameters() if p.grad is not None]
+        flat = torch.cat(values) if values else torch.zeros(1, device=DEVICE)
         rows.append({
             "layer": layer,
-            "norm": norm,
-            "mean": mean,
-            "min": minimum,
-            "max": maximum,
+            "norm": float(flat.norm().item()),
+            "mean": float(flat.mean().item()),
+            "min": float(flat.min().item()),
+            "max": float(flat.max().item()),
         })
     return rows
 
 
-def _score_probability_and_retention(model, batch, target_ratio):
-    input_ids = batch["input_ids"].to(DEVICE)
-    attention_mask = batch["attention_mask"].to(DEVICE)
+def _batch_on_device(batch):
+    return {key: value.to(DEVICE) for key, value in batch.items() if torch.is_tensor(value)}
+
+
+def _teacher_targets(teacher, batch):
     with torch.no_grad():
-        _, _, metrics = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            return_layer_metrics=True,
-            training=True,
-            minimum_retention_ratio=target_ratio,
-            answer_span_mask=None,
+        return teacher.model(
+            batch["input_ids"], batch["attention_mask"], output_hidden_states=True
         )
-        results = [result for result in metrics["selection_results"] if result is not None]
-        score_values = torch.cat([result.retention_scores.detach().float().reshape(-1) for result in results])
-        probability_values = torch.cat([result.retention_probs.detach().float().reshape(-1) for result in results])
-        soft_retention = torch.stack([result.soft_retention_ratio.detach().float() for result in results]).mean()
-    return {
-        "score_mean": float(score_values.mean().item()),
-        "probability_mean": float(probability_values.mean().item()),
-        "soft_retention": float(soft_retention.item()),
-    }
 
 
-def _build_production_terms(model, teacher, batch, target_ratio):
-    input_ids = batch["input_ids"].to(DEVICE)
-    attention_mask = batch["attention_mask"].to(DEVICE)
-    start_target = batch["start_positions"].to(DEVICE)
-    end_target = batch["end_positions"].to(DEVICE)
-
-    with torch.no_grad():
-        teacher_outputs = teacher.model(input_ids, attention_mask, output_hidden_states=True)
-
-    student_start, student_end, metrics = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
+def _fresh_forward(model, teacher_outputs, batch, target_ratio):
+    start_logits, end_logits, metrics = model(
+        input_ids=batch["input_ids"],
+        attention_mask=batch["attention_mask"],
         return_layer_metrics=True,
         training=True,
         minimum_retention_ratio=target_ratio,
         answer_span_mask=None,
     )
-    qa_loss = (F.cross_entropy(student_start, start_target) + F.cross_entropy(student_end, end_target)) / 2.0
+    results = [result for result in metrics["selection_results"] if result is not None]
+    qa_loss = (
+        F.cross_entropy(start_logits, batch["start_positions"])
+        + F.cross_entropy(end_logits, batch["end_positions"])
+    ) / 2.0
     kd_loss = calculate_distillation_loss(
-        student_start, student_end,
+        start_logits, end_logits,
         teacher_outputs.start_logits.detach(), teacher_outputs.end_logits.detach(),
         temperature=2.0,
     )
-    hidden_kd_loss = torch.zeros((), device=DEVICE)
-    results = []
+    hidden_loss = torch.zeros((), device=DEVICE)
     for layer_idx, result in enumerate(metrics["selection_results"]):
         if result is None:
             continue
-        results.append(result)
-        hidden_kd_loss = hidden_kd_loss + calculate_hidden_state_distillation_loss(
+        hidden_loss = hidden_loss + calculate_hidden_state_distillation_loss(
             student_hidden=metrics["hidden_states"][layer_idx],
             teacher_hidden=teacher_outputs.hidden_states[layer_idx + 1].detach(),
             selected_indices=result.selected_indices,
             attention_mask=result.new_attention_mask,
         )
-    soft_retention = torch.stack([result.soft_retention_ratio for result in results]).mean()
-    return {
-        "qa": qa_loss,
-        "kd": kd_loss,
-        "hidden": hidden_kd_loss,
-        "soft_retention": soft_retention,
-        "results": results,
-    }
-
-
-def _global_token_weighted_retention(results):
+    base_retention = torch.stack([result.soft_retention_ratio for result in results]).mean()
     numerator = torch.zeros((), device=DEVICE)
     denominator = torch.zeros((), device=DEVICE)
     for result in results:
-        valid = result.actual_valid_counts.detach().float().sum()
-        probabilities = result.retention_probs.float()
-        # Training probabilities are full-sequence tensors; valid counts are
-        # reconstructed from the production attention-mask path by retaining
-        # only the valid prefix/count per example.
-        for row, count in zip(probabilities, result.actual_valid_counts.detach().long()):
-            count = int(count.item())
+        for row, valid_count in zip(result.retention_probs, result.actual_valid_counts.detach().long()):
+            count = int(valid_count.item())
             numerator = numerator + row[:count].sum()
             denominator = denominator + float(count)
-    return numerator / denominator.clamp_min(1.0)
-
-
-def _budget_from_retention(retention, target_ratio, lambda_value):
-    violation = torch.relu(torch.as_tensor(target_ratio, device=retention.device) - retention)
-    raw_lambda_term = lambda_value * violation
-    clamped = torch.clamp(raw_lambda_term, min=0.0, max=10.0)
-    return violation, raw_lambda_term, clamped
-
-
-def _run_gradient_case(model, terms, target_ratio, lambda_value, alpha, retention_key="base"):
-    _zero_grads(model)
-    retention = terms["soft_retention"] if retention_key == "base" else terms["retention_c"]
-    violation, raw_lambda_term, clamped = _budget_from_retention(retention, target_ratio, lambda_value)
-    budget_loss = alpha * clamped
-    budget_loss.backward(retain_graph=True)
-    budget_rows = _layer_grad_stats(model)
-    budget_norms = [row["norm"] for row in budget_rows]
-    _zero_grads(model)
-    combined = terms["qa"] + terms["kd"] + terms["hidden"] + budget_loss.detach() * 0.0
-    # Rebuild the budget term so the combined graph remains connected.
-    combined = terms["qa"] + terms["kd"] + terms["hidden"] + alpha * clamped
-    combined.backward()
-    combined_rows = _layer_grad_stats(model)
-    _zero_grads(model)
+    normalized_c_retention = numerator / denominator.clamp_min(1.0)
     return {
-        "retention": float(retention.detach().item()),
-        "violation": float(violation.detach().item()),
-        "lambda_violation": float(raw_lambda_term.detach().item()),
-        "clamped_budget": float(clamped.detach().item()),
-        "scaled_budget": float(budget_loss.detach().item()),
-        "budget_rows": budget_rows,
-        "combined_rows": combined_rows,
-        "budget_norms": budget_norms,
-        "combined_norms": [row["norm"] for row in combined_rows],
+        "qa": qa_loss,
+        "kd": kd_loss,
+        "hidden": hidden_loss,
+        "base_retention": base_retention,
+        "c_retention": normalized_c_retention,
     }
 
 
-def _clone_step(model, teacher, batch, target_ratio, lambda_value, alpha):
-    clone = copy.deepcopy(model).to(DEVICE)
+def _budget_terms(retention, target_ratio, lambda_value):
+    violation = torch.relu(torch.as_tensor(target_ratio, device=retention.device) - retention)
+    unscaled = lambda_value * violation
+    clamped = torch.clamp(unscaled, min=0.0, max=10.0)
+    return violation, unscaled, clamped
+
+
+def _stats_snapshot(model, teacher_outputs, batch, target_ratio):
+    with torch.no_grad():
+        forward = _fresh_forward(model, teacher_outputs, batch, target_ratio)
+        results = []
+        # A second fresh forward is intentionally avoided here only because all
+        # values are detached and this function is used for reporting.
+        model.eval()
+        _, _, metrics = model(
+            input_ids=batch["input_ids"], attention_mask=batch["attention_mask"],
+            return_layer_metrics=True, training=True,
+            minimum_retention_ratio=target_ratio, answer_span_mask=None,
+        )
+        model.train()
+        results = [result for result in metrics["selection_results"] if result is not None]
+        scores = torch.cat([result.retention_scores.float().reshape(-1) for result in results])
+        probs = torch.cat([result.retention_probs.float().reshape(-1) for result in results])
+    return {
+        "score_mean": float(scores.mean().item()),
+        "probability_mean": float(probs.mean().item()),
+        "soft_retention": float(forward["base_retention"].item()),
+    }
+
+
+def _fresh_gradient(model, teacher_outputs, batch, target_ratio, kind, lambda_value, alpha=1, retention_key="base"):
+    model.train()
+    _zero_grads(model)
+    terms = _fresh_forward(model, teacher_outputs, batch, target_ratio)
+    if kind == "qa":
+        loss = terms["qa"]
+    elif kind == "kd":
+        loss = terms["kd"]
+    elif kind == "hidden":
+        loss = terms["hidden"]
+    elif kind == "budget":
+        retention = terms["base_retention"] if retention_key == "base" else terms["c_retention"]
+        violation, unscaled, clamped = _budget_terms(retention, target_ratio, lambda_value)
+        loss = alpha * clamped
+        print(
+            f"BUDGET CHECK [{retention_key}] alpha={alpha}: "
+            f"r={retention.detach().item():.8e} tau={target_ratio:.8e} "
+            f"violation={violation.detach().item():.8e} lambda={lambda_value:.8e} "
+            f"unscaled={unscaled.detach().item():.8e} clamped={clamped.detach().item():.8e} "
+            f"requires_grad={loss.requires_grad}"
+        )
+        if not loss.requires_grad:
+            raise RuntimeError("Budget loss is disconnected from scorer graph")
+    elif kind == "combined":
+        retention = terms["base_retention"] if retention_key == "base" else terms["c_retention"]
+        _, _, clamped = _budget_terms(retention, target_ratio, lambda_value)
+        loss = terms["qa"] + terms["kd"] + terms["hidden"] + alpha * clamped
+    else:
+        raise ValueError(kind)
+    loss.backward()
+    rows = _layer_grad_stats(model)
+    _zero_grads(model)
+    return terms, rows
+
+
+def _finite_difference(model, teacher_outputs, batch, target_ratio, lambda_value):
+    terms = _fresh_forward(model, teacher_outputs, batch, target_ratio)
+    retention = terms["base_retention"].detach()
+    base = float(_budget_terms(retention, target_ratio, lambda_value)[2].item())
+    delta = 1e-3
+    scorer = model.retention_scorers[0]
+    parameter = next(scorer.parameters())
+    with torch.no_grad():
+        original = parameter.view(-1)[0].item()
+        parameter.view(-1)[0].fill_(original + delta)
+    plus_terms = _fresh_forward(model, teacher_outputs, batch, target_ratio)
+    plus = float(_budget_terms(plus_terms["base_retention"].detach(), target_ratio, lambda_value)[2].item())
+    with torch.no_grad():
+        parameter.view(-1)[0].fill_(original - delta)
+    minus_terms = _fresh_forward(model, teacher_outputs, batch, target_ratio)
+    minus = float(_budget_terms(minus_terms["base_retention"].detach(), target_ratio, lambda_value)[2].item())
+    with torch.no_grad():
+        parameter.view(-1)[0].fill_(original)
+    if float(terms["base_retention"].detach().item()) < target_ratio and not (plus >= base - 1e-10 and minus <= base + 1e-10):
+        raise RuntimeError(f"Finite-difference budget direction failed: minus={minus}, base={base}, plus={plus}")
+    print(f"FINITE DIFFERENCE: lower={minus:.8e} base={base:.8e} higher={plus:.8e}")
+
+
+def _simulated_step(source_model, teacher, batch, target_ratio, lambda_value, alpha, kind):
+    clone = copy.deepcopy(source_model).to(DEVICE)
     clone.train()
-    optimizer = AdamW(clone.retention_scorers.parameters(), lr=1e-4)
-    before = _score_probability_and_retention(clone, batch, target_ratio)
-    terms = _build_production_terms(clone, teacher, batch, target_ratio)
-    _, _, clamped = _budget_from_retention(terms["soft_retention"], target_ratio, lambda_value)
-    total = terms["qa"] + terms["kd"] + terms["hidden"] + alpha * clamped
-    total.backward()
+    teacher_outputs = _teacher_targets(teacher, batch)
+    before = _stats_snapshot(clone, teacher_outputs, batch, target_ratio)
+    terms = _fresh_forward(clone, teacher_outputs, batch, target_ratio)
+    retention = terms["base_retention"]
+    _, _, clamped = _budget_terms(retention, target_ratio, lambda_value)
+    if kind == "budget":
+        loss = alpha * clamped
+    elif kind == "combined":
+        loss = terms["qa"] + terms["kd"] + terms["hidden"] + alpha * clamped
+    else:
+        raise ValueError(kind)
+    if not loss.requires_grad:
+        raise RuntimeError(f"{kind} simulation loss is disconnected")
+    loss.backward()
     with torch.no_grad():
         for parameter in clone.retention_scorers.parameters():
             if parameter.grad is not None:
-                parameter.add_(-1e-4 * parameter.grad)
-    after = _score_probability_and_retention(clone, batch, target_ratio)
-    del optimizer
+                parameter.add_(-source_model._diagnostic_lr * parameter.grad)
+    after = _stats_snapshot(clone, teacher_outputs, batch, target_ratio)
+    if kind == "budget" and after["soft_retention"] > before["soft_retention"] + 1e-8:
+        raise RuntimeError(
+            f"Budget-only update increased retention: {before['soft_retention']} -> {after['soft_retention']}"
+        )
     del clone
     return before, after
 
 
-def _make_batch(batch):
-    # Keep one fixed batch on CPU so cloned diagnostic models can reuse it.
-    return {key: value.detach().cpu() for key, value in batch.items() if torch.is_tensor(value)}
-
-
-def run_diagnostic(args):
+def _load_and_prepare(args):
     if not os.path.isfile(args.checkpoint):
         raise RuntimeError(f"Checkpoint does not exist: {args.checkpoint}")
     _, val_dl, _, _, _ = get_squad_dataloaders(
-        batch_size=args.batch_size,
-        max_train_samples=1,
-        max_val_samples=max(1, args.num_examples),
+        batch_size=args.batch_size, max_train_samples=1, max_val_samples=max(1, args.num_examples)
     )
-    batch = _make_batch(next(iter(val_dl)))
+    batch = _batch_on_device({key: value.detach().cpu() for key, value in next(iter(val_dl)).items() if torch.is_tensor(value)})
     model = AdaptiveDistilBertQA(model_name=MODEL_NAME, device=DEVICE, freeze_transformer=True).to(DEVICE)
     checkpoint = load_ammr_checkpoint(model, args.checkpoint)
+    teacher = BaselineQAModel(freeze_parameters=True)
+    teacher.qa_model.eval()
+    model._diagnostic_lr = float(args.learning_rate)
+    return model, teacher, batch, checkpoint
+
+
+def run_diagnostic(args):
+    model, teacher, batch, checkpoint = _load_and_prepare(args)
     metadata = checkpoint if isinstance(checkpoint, dict) else {}
     target_ratio = float(args.target_ratio if args.target_ratio is not None else metadata.get("target_ratio", 0.60))
     lambda_value = float(metadata.get("lagrangian_multiplier", 0.0))
-    teacher = BaselineQAModel(freeze_parameters=True)
-    teacher.qa_model.eval()
-    model.train()
-
-    terms = _build_production_terms(model, teacher, batch, target_ratio)
-    terms["retention_c"] = _global_token_weighted_retention(terms["results"])
-    base_before = _score_probability_and_retention(model, batch, target_ratio)
-
+    teacher_outputs = _teacher_targets(teacher, batch)
     print("AMMR BUDGET COEFFICIENT SWEEP")
     print(f"Checkpoint: {os.path.abspath(args.checkpoint)}")
     print(f"Epoch: {metadata.get('epoch', 'N/A')}; Step: {metadata.get('step', 'N/A')}")
@@ -241,38 +259,40 @@ def run_diagnostic(args):
     print("Normal benchmark-style answer_span_mask=None: yes")
     print("Original production model optimizer.step(): never")
 
+    _, base_budget_rows = _fresh_gradient(model, teacher_outputs, batch, target_ratio, "budget", lambda_value)
+    first_terms = _fresh_forward(model, teacher_outputs, batch, target_ratio)
+    if float(first_terms["base_retention"].detach().item()) >= target_ratio:
+        raise RuntimeError("Selected batch is not violating tau > r; choose another fixed validation batch")
+    _finite_difference(model, teacher_outputs, batch, target_ratio, lambda_value)
+    budget_before, budget_after = _simulated_step(model, teacher, batch, target_ratio, lambda_value, 1, "budget")
+    print(f"ALPHA=1 DIRECTION CHECK: retention {budget_before['soft_retention']:.8e} -> {budget_after['soft_retention']:.8e}")
+
     print("\nTABLE 1")
     print("alpha | budget_grad | combined_grad | budget/combined | soft_retention_delta")
-    table1 = []
+    results = {}
     for alpha in ALPHAS:
-        result = _run_gradient_case(model, terms, target_ratio, lambda_value, alpha)
-        before, after = _clone_step(model, teacher, batch, target_ratio, lambda_value, alpha)
-        budget_total = sum(result["budget_norms"])
-        combined_total = sum(result["combined_norms"])
-        ratio = budget_total / max(combined_total, EPSILON)
+        _, budget_rows = _fresh_gradient(model, teacher_outputs, batch, target_ratio, "budget", lambda_value, alpha)
+        _, combined_rows = _fresh_gradient(model, teacher_outputs, batch, target_ratio, "combined", lambda_value, alpha)
+        before, after = _simulated_step(model, teacher, batch, target_ratio, lambda_value, alpha, "combined")
+        budget_total = sum(row["norm"] for row in budget_rows)
+        combined_total = sum(row["norm"] for row in combined_rows)
         delta = after["soft_retention"] - before["soft_retention"]
-        table1.append((alpha, budget_total, combined_total, ratio, delta))
-        print(f"{alpha} | {budget_total:.8e} | {combined_total:.8e} | {ratio:.8e} | {delta:.8e}")
+        results[alpha] = (budget_rows, combined_rows)
+        print(f"{alpha} | {budget_total:.8e} | {combined_total:.8e} | {budget_total / max(combined_total, EPSILON):.8e} | {delta:.8e}")
         print(f"  score mean {before['score_mean']:.8e} -> {after['score_mean']:.8e}; probability mean {before['probability_mean']:.8e} -> {after['probability_mean']:.8e}; retention {before['soft_retention']:.8e} -> {after['soft_retention']:.8e}")
 
     print("\nTABLE 2")
     print("layer | alpha=1 | alpha=10 | alpha=100 | alpha=1000 | alpha=10000")
-    layer_rows = []
     for layer in range(len(model.retention_scorers)):
-        values = []
-        for alpha in ALPHAS:
-            result = _run_gradient_case(model, terms, target_ratio, lambda_value, alpha)
-            values.append(result["budget_norms"][layer])
-        layer_rows.append(values)
-        print(layer, *[f"{value:.8e}" for value in values], sep=" | ")
+        print(layer, *[f"{results[alpha][0][layer]['norm']:.8e}" for alpha in ALPHAS], sep=" | ")
 
     print("\nTABLE 3")
     print("formulation | r | violation | budget gradient by layer")
     for name, key in (("BASE", "base"), ("NORMALIZED-C", "c")):
-        result = _run_gradient_case(model, terms, target_ratio, lambda_value, 1, retention_key=key)
-        layer_gradient_text = [f"{row['norm']:.8e}" for row in result['budget_rows']]
-        print(f"{name} | {result['retention']:.8e} | {result['violation']:.8e} | {layer_gradient_text}")
-    print(f"BASE initial score/probability/retention: {base_before}")
+        terms, rows = _fresh_gradient(model, teacher_outputs, batch, target_ratio, "budget", lambda_value, 1, key)
+        retention = terms["base_retention"] if key == "base" else terms["c_retention"]
+        violation, _, _ = _budget_terms(retention, target_ratio, lambda_value)
+        print(f"{name} | {retention.detach().item():.8e} | {violation.detach().item():.8e} | {[f'{row['norm']:.8e}' for row in rows]}")
     print("No production parameters or checkpoint files were modified.")
 
 
