@@ -240,6 +240,55 @@ class TestAdaptiveComponents(unittest.TestCase):
             )
         self.assertGreaterEqual(float(metrics['actual_retention_ratio']), 0.80 - 1e-4)
 
+    def test_training_diagnostic_reports_full_sequence_and_soft_statistics(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        scores = torch.full((1, self.seq_len), -10.0, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        protected[:, 0] = True
+        attention = torch.ones(1, self.seq_len, device=self.device)
+        result = selector.select_adaptive(hidden, scores, protected, attention, training=True, minimum_retention_ratio=0.95)
+        self.assertEqual(result.actual_retained_counts.item(), self.seq_len)
+        self.assertEqual(result.raw_retained_counts.item(), 0)
+        self.assertEqual(result.floor_added_counts.item(), 0)
+        self.assertFalse(result.topk_repair_activated)
+        self.assertAlmostEqual(float(result.retention_probs.mean()), 1e-6, places=7)
+        self.assertGreater(float(result.soft_retention_ratio), 0.0)
+
+    def test_hard_diagnostic_records_raw_and_floor_counts(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        scores = torch.full((1, self.seq_len), -10.0, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(1, self.seq_len, device=self.device)
+        result = selector.select_adaptive(hidden, scores, protected, attention, training=False, minimum_retention_ratio=0.8)
+        self.assertEqual(result.raw_retained_counts.item(), 0)
+        self.assertEqual(result.actual_retained_counts.item(), 8)
+        self.assertEqual(result.floor_added_counts.item(), 8)
+        self.assertTrue(result.topk_repair_activated)
+
+    def test_hard_probability_direction_changes_retention(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(1, self.seq_len, device=self.device)
+        low = selector.select_adaptive(hidden, torch.full((1, self.seq_len), -10.0, device=self.device), protected, attention, training=False, minimum_retention_ratio=0.0)
+        high = selector.select_adaptive(hidden, torch.full((1, self.seq_len), 10.0, device=self.device), protected, attention, training=False, minimum_retention_ratio=0.0)
+        self.assertLess(float(low.retention_probs.mean()), float(high.retention_probs.mean()))
+        self.assertLess(low.actual_retained_counts.item(), high.actual_retained_counts.item())
+
+    def test_target_floor_can_retain_fewer_tokens(self):
+        selector = TokenSelector(device=self.device)
+        hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)
+        scores = torch.full((1, self.seq_len), -10.0, device=self.device)
+        protected = torch.zeros(1, self.seq_len, dtype=torch.bool, device=self.device)
+        attention = torch.ones(1, self.seq_len, device=self.device)
+        at_95 = selector.select_adaptive(hidden, scores, protected, attention, training=False, minimum_retention_ratio=0.95)
+        at_90 = selector.select_adaptive(hidden, scores, protected, attention, training=False, minimum_retention_ratio=0.90)
+        self.assertEqual(at_95.actual_retained_counts.item(), 10)
+        self.assertEqual(at_90.actual_retained_counts.item(), 9)
+        self.assertLess(at_90.actual_retained_counts.item(), at_95.actual_retained_counts.item())
+
     def test_padding_positions_are_never_retained_or_counted(self):
         selector = TokenSelector(device=self.device)
         hidden = torch.randn(1, self.seq_len, self.hidden_dim, device=self.device)

@@ -110,6 +110,9 @@ class TokenSelectionResult:
         # This is the actual mask cardinality used for compaction. It is
         # intentionally separate from the scorer probabilities.
         self.actual_retained_counts: Optional[torch.Tensor] = None
+        self.raw_retained_counts: Optional[torch.Tensor] = None
+        self.floor_added_counts: Optional[torch.Tensor] = None
+        self.topk_repair_activated: bool = False
         self.actual_valid_counts: Optional[torch.Tensor] = None
         self.minimum_retention_ratio: Optional[float] = None
         self.selected_valid_mask: Optional[torch.Tensor] = None
@@ -156,6 +159,9 @@ class TokenSelector:
                 threshold_bias=threshold_bias
             )
 
+        raw_gate_mask = (z > 0).detach()
+        raw_gate_counts = raw_gate_mask.sum(dim=1)
+
         # ------------------------------------------------------------
         # 2. Always protect [CLS] / [SEP]
         # ------------------------------------------------------------
@@ -201,6 +207,9 @@ class TokenSelector:
                 num_original=seq_len,
             )
             result.actual_retained_counts = valid_tokens.sum(dim=1)
+            result.raw_retained_counts = torch.zeros_like(result.actual_retained_counts)
+            result.floor_added_counts = torch.zeros_like(result.actual_retained_counts)
+            result.topk_repair_activated = False
             result.actual_valid_counts = valid_tokens.sum(dim=1)
             result.selected_valid_mask = valid_tokens
             result.minimum_retention_ratio = float(max(0.0, min(1.0, float(minimum_retention_ratio))))
@@ -227,6 +236,7 @@ class TokenSelector:
             protected_mask.sum(dim=1).to(dtype=torch.long)
         )
 
+        pre_repair_counts = keep_mask.sum(dim=1).detach()
         for batch_idx in range(batch_size):
             current_count = int(keep_mask[batch_idx].sum().item())
             required_count = min(int(required_counts[batch_idx].item()), int(valid_tokens[batch_idx].sum().item()))
@@ -244,6 +254,8 @@ class TokenSelector:
         max_retained = int(retained_counts.max().item())
         if max_retained == 0:
             max_retained = 1
+
+        raw_retained_counts = pre_repair_counts.detach()
 
         # ------------------------------------------------------------
         # 5. Continuous gating for gradient flow.
@@ -328,6 +340,9 @@ class TokenSelector:
             num_original=seq_len
         )
         result.actual_retained_counts = retained_counts.detach()
+        result.raw_retained_counts = raw_gate_counts
+        result.floor_added_counts = (retained_counts - raw_retained_counts).detach()
+        result.topk_repair_activated = bool(torch.any(result.floor_added_counts > 0).item())
         result.actual_valid_counts = valid_tokens.sum(dim=1).detach()
         result.selected_valid_mask = torch.gather(
             valid_tokens, 1, selected_indices
