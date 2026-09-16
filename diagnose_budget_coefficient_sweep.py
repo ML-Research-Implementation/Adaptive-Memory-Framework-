@@ -28,7 +28,8 @@ def build_parser():
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--target-ratio", type=float, default=None)
-    parser.add_argument("--num-examples", type=int, default=1)
+    parser.add_argument("--num-examples", type=int, default=50)
+    parser.add_argument("--max-search-batches", type=int, default=50)
     parser.add_argument("--learning-rate", type=float, default=3e-4,
                         help="Temporary diagnostic step size; production scorer LR is reported separately")
     return parser
@@ -234,24 +235,72 @@ def _load_and_prepare(args):
     if not os.path.isfile(args.checkpoint):
         raise RuntimeError(f"Checkpoint does not exist: {args.checkpoint}")
     _, val_dl, _, _, _ = get_squad_dataloaders(
-        batch_size=args.batch_size, max_train_samples=1, max_val_samples=max(1, args.num_examples)
+        batch_size=args.batch_size,
+        max_train_samples=1,
+        max_val_samples=max(1, args.num_examples),
     )
-    batch = _batch_on_device({key: value.detach().cpu() for key, value in next(iter(val_dl)).items() if torch.is_tensor(value)})
     model = AdaptiveDistilBertQA(model_name=MODEL_NAME, device=DEVICE, freeze_transformer=True).to(DEVICE)
     checkpoint = load_ammr_checkpoint(model, args.checkpoint)
     teacher = BaselineQAModel(freeze_parameters=True)
     teacher.qa_model.eval()
     model._diagnostic_lr = float(args.learning_rate)
-    return model, teacher, batch, checkpoint
+    return model, teacher, val_dl, checkpoint
+
+
+def _find_first_violating_batch(model, val_dl, target_ratio, max_search_batches):
+    model.eval()
+    minimum = (float("inf"), None)
+    with torch.no_grad():
+        for batch_index, raw_batch in enumerate(val_dl):
+            if batch_index >= max_search_batches:
+                break
+            batch = _batch_on_device({
+                key: value.detach().cpu()
+                for key, value in raw_batch.items()
+                if torch.is_tensor(value)
+            })
+            _, _, metrics = model(
+                input_ids=batch["input_ids"],
+                attention_mask=batch["attention_mask"],
+                return_layer_metrics=True,
+                training=True,
+                minimum_retention_ratio=target_ratio,
+                answer_span_mask=None,
+            )
+            results = [result for result in metrics["selection_results"] if result is not None]
+            retention = float(torch.stack([
+                result.soft_retention_ratio.detach().float() for result in results
+            ]).mean().item())
+            if retention < minimum[0]:
+                minimum = (retention, batch_index)
+            if retention < target_ratio:
+                example_indices = list(range(
+                    batch_index * batch["input_ids"].shape[0],
+                    batch_index * batch["input_ids"].shape[0] + batch["input_ids"].shape[0],
+                ))
+                return batch, batch_index, example_indices, retention
+    print(
+        "NO VIOLATING BATCH FOUND: "
+        f"searched {min(max_search_batches, len(val_dl))} batches; "
+        f"minimum observed soft retention={minimum[0]:.8e} at batch index={minimum[1]}"
+    )
+    return None
 
 
 def run_diagnostic(args):
-    model, teacher, batch, checkpoint = _load_and_prepare(args)
+    model, teacher, val_dl, checkpoint = _load_and_prepare(args)
     metadata = checkpoint if isinstance(checkpoint, dict) else {}
     target_ratio = float(args.target_ratio if args.target_ratio is not None else metadata.get("target_ratio", 0.60))
     lambda_value = float(metadata.get("lagrangian_multiplier", 0.0))
+    found = _find_first_violating_batch(model, val_dl, target_ratio, args.max_search_batches)
+    if found is None:
+        return
+    batch, batch_index, example_indices, found_retention = found
+    assert found_retention < target_ratio
     teacher_outputs = _teacher_targets(teacher, batch)
     print("AMMR BUDGET COEFFICIENT SWEEP")
+    print(f"FOUND VIOLATING BATCH: batch index={batch_index}; example indices={example_indices}")
+    print(f"r={found_retention:.8e}; tau={target_ratio:.8e}; violation={target_ratio - found_retention:.8e}; lambda={lambda_value:.8e}")
     print(f"Checkpoint: {os.path.abspath(args.checkpoint)}")
     print(f"Epoch: {metadata.get('epoch', 'N/A')}; Step: {metadata.get('step', 'N/A')}")
     print(f"Target ratio: {target_ratio}; Lambda: {lambda_value}")
@@ -259,10 +308,11 @@ def run_diagnostic(args):
     print("Normal benchmark-style answer_span_mask=None: yes")
     print("Original production model optimizer.step(): never")
 
-    _, base_budget_rows = _fresh_gradient(model, teacher_outputs, batch, target_ratio, "budget", lambda_value)
     first_terms = _fresh_forward(model, teacher_outputs, batch, target_ratio)
-    if float(first_terms["base_retention"].detach().item()) >= target_ratio:
-        raise RuntimeError("Selected batch is not violating tau > r; choose another fixed validation batch")
+    frozen_retention = float(first_terms["base_retention"].detach().item())
+    if not frozen_retention < target_ratio:
+        raise RuntimeError("Frozen batch no longer violates tau > r")
+    print(f"Frozen-batch verification: r={frozen_retention:.8e} < tau={target_ratio:.8e}")
     _finite_difference(model, teacher_outputs, batch, target_ratio, lambda_value)
     budget_before, budget_after = _simulated_step(model, teacher, batch, target_ratio, lambda_value, 1, "budget")
     print(f"ALPHA=1 DIRECTION CHECK: retention {budget_before['soft_retention']:.8e} -> {budget_after['soft_retention']:.8e}")
