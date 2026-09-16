@@ -396,6 +396,8 @@ def _train_with_report(args, report, report_json_path, report_text_path,
                         # Scheduler advances only after a real optimizer step.
                         if scaler.get_scale() == scale_before:
                             scheduler.step()
+                            epoch_optimizer_steps += 1
+                            epoch_grad_norm_sum += float(grad_norm.detach().item())
                     else:
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update()
