@@ -200,7 +200,7 @@ def _train_with_report(args, report, report_json_path, report_text_path,
     
     optimizer = AdamW(student.retention_scorers.parameters(), lr=scorer_learning_rate)
     
-    total_steps = len(train_dl) * args.epochs
+    total_steps = (len(train_dl) // getattr(args, 'gradient_accumulation_steps', 1)) * args.epochs
     warmup_steps = int(0.1 * total_steps)
     
     scheduler = get_linear_schedule_with_warmup(
@@ -362,6 +362,9 @@ def _train_with_report(args, report, report_json_path, report_text_path,
                     alpha=50.0
                 )
                 total_loss = qa_loss + lambda_kd * logit_kd_loss + lambda_h * hidden_kd_loss + lambda_b * budget_loss
+                
+                if hasattr(args, 'gradient_accumulation_steps') and args.gradient_accumulation_steps > 1:
+                    total_loss = total_loss / args.gradient_accumulation_steps
 
             losses_finite = all(torch.isfinite(value).item() for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
             losses_stable = all(value.detach().abs().item() <= max_stable_loss for value in (qa_loss, logit_kd_loss, hidden_kd_loss, total_loss))
@@ -375,29 +378,32 @@ def _train_with_report(args, report, report_json_path, report_text_path,
             if should_update_scorer:
                 if use_amp and scaler is not None:
                     scaler.scale(total_loss).backward()
-                    scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=0.5)
-                    if torch.isfinite(grad_norm):
-                        scale_before = scaler.get_scale()
-                        scaler.step(optimizer)
-                        scaler.update()
-                        # Scheduler advances only after a real optimizer step.
-                        if scaler.get_scale() == scale_before:
-                            scheduler.step()
-                            epoch_optimizer_steps += 1
-                            epoch_grad_norm_sum += float(grad_norm.detach().item())
-                    else:
+                    
+                    if (global_step + 1) % args.gradient_accumulation_steps == 0 or (global_step + 1) == len(train_dl):
+                        scaler.unscale_(optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=0.5)
+                        if torch.isfinite(grad_norm):
+                            scale_before = scaler.get_scale()
+                            scaler.step(optimizer)
+                            scaler.update()
+                            if scaler.get_scale() == scale_before:
+                                scheduler.step()
+                                epoch_optimizer_steps += 1
+                                epoch_grad_norm_sum += float(grad_norm.detach().item())
+                        else:
+                            optimizer.zero_grad(set_to_none=True)
+                            scaler.update()
                         optimizer.zero_grad(set_to_none=True)
-                        scaler.update()
                 else:
                     total_loss.backward()
-                    grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=0.5)
-                    epoch_grad_norm_sum += float(grad_norm.detach().item())
-                    if torch.isfinite(grad_norm):
-                        optimizer.step()
-                        scheduler.step()
-                        epoch_optimizer_steps += 1
-                    else:
+                    
+                    if (global_step + 1) % args.gradient_accumulation_steps == 0 or (global_step + 1) == len(train_dl):
+                        grad_norm = torch.nn.utils.clip_grad_norm_(student.retention_scorers.parameters(), max_norm=0.5)
+                        epoch_grad_norm_sum += float(grad_norm.detach().item())
+                        if torch.isfinite(grad_norm):
+                            optimizer.step()
+                            scheduler.step()
+                            epoch_optimizer_steps += 1
                         optimizer.zero_grad(set_to_none=True)
             else:
                 # Do not let unstable gradients alter scorer logits or the
@@ -441,6 +447,7 @@ def _train_with_report(args, report, report_json_path, report_text_path,
         avg_violation = epoch_violation / num_batches
         lambda_after = lagrangian_multiplier
         avg_raw_violation_ratio = epoch_raw_violation / num_batches
+        avg_budget_loss = epoch_budget_loss / num_batches
         epoch_last_scorer_checksum = sum(parameter.detach().float().sum().item() for parameter in student.retention_scorers.parameters())
         epoch_last_student_checksum = sum(parameter.detach().float().sum().item() for parameter in student.parameters())
         print(f"  Runtime diagnostics: student={epoch_first_student_checksum:.8e}->{epoch_last_student_checksum:.8e}; scorer={epoch_first_scorer_checksum:.8e}->{epoch_last_scorer_checksum:.8e}; steps={epoch_optimizer_steps}; skips={epoch_optimizer_skips}; grad_norm_sum={epoch_grad_norm_sum:.8e}; lambda={epoch_lambda_start:.8e}->{lagrangian_multiplier:.8e}")
@@ -545,6 +552,7 @@ if __name__ == "__main__":
     parser.add_argument("--max_train_samples", type=int, default=5000, help="Max training samples")
     parser.add_argument("--max_val_samples", type=int, default=500, help="Max validation samples")
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Steps to accumulate gradients before update")
     parser.add_argument("--learning_rate", type=float, default=3e-3, help="Base learning rate; scorer uses a conservative fraction")
     parser.add_argument("--resume_from", type=str, default=None, help="Path to checkpoint to resume from")
     parser.add_argument("--results_json", type=str, default="training_results.json", help="JSON results path")
