@@ -538,5 +538,41 @@ class TestAdaptiveComponents(unittest.TestCase):
         # For normal (non-overflowing) gradients all 3 steps should have fired
         self.assertEqual(steps_taken, 3)
 
+    def test_exact_target_gradient_direction(self):
+        from src.losses import calculate_exact_target_budget_loss
+        
+        # Scenario 1: E > target -> We want retention to decrease, so gradients w.r.t E should be positive (pushing down)
+        scores_above = torch.tensor([2.0, 3.0], requires_grad=True)
+        E_above = torch.sigmoid(scores_above).mean() # ~ 0.91
+        loss_above = calculate_exact_target_budget_loss(E_above, 0.60, alpha=50.0)
+        loss_above.backward()
+        self.assertGreater(float(scores_above.grad.mean()), 0.0) # Gradient pushes score down
+        
+        # Scenario 2: E < target -> We want retention to increase, so gradients w.r.t E should be negative (pushing up)
+        scores_below = torch.tensor([-2.0, -3.0], requires_grad=True)
+        E_below = torch.sigmoid(scores_below).mean() # ~ 0.08
+        loss_below = calculate_exact_target_budget_loss(E_below, 0.60, alpha=50.0)
+        loss_below.backward()
+        self.assertLess(float(scores_below.grad.mean()), 0.0) # Gradient pushes score up
+
+    def test_exact_target_gradient_nonzero_when_off_target(self):
+        from src.losses import calculate_exact_target_budget_loss
+        scores = torch.tensor([0.0, 0.0], requires_grad=True)
+        E = torch.sigmoid(scores).mean() # 0.50
+        loss = calculate_exact_target_budget_loss(E, 0.60, alpha=50.0)
+        loss.backward()
+        self.assertNotEqual(float(scores.grad.abs().sum()), 0.0)
+
+    def test_exact_target_gradient_zero_at_target(self):
+        from src.losses import calculate_exact_target_budget_loss
+        # To get E=0.6, sigmoid(x) = 0.6 -> x = ln(0.6/0.4) = 0.405465
+        scores = torch.tensor([0.405465, 0.405465], requires_grad=True)
+        E = torch.sigmoid(scores).mean() # ~ 0.60
+        loss = calculate_exact_target_budget_loss(E, 0.60, alpha=50.0)
+        loss.backward()
+        self.assertAlmostEqual(float(scores.grad.abs().sum()), 0.0, places=4)
+
+
 if __name__ == "__main__":
     unittest.main()
+

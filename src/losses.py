@@ -261,6 +261,28 @@ def calculate_lagrangian_budget_loss(
     return lagrangian_multiplier * (expected_retained_tokens - target_budget)
 
 
+def calculate_exact_target_budget_loss(
+    expected_retained_ratio: torch.Tensor,
+    target_ratio: float,
+    alpha: float = 50.0
+) -> torch.Tensor:
+    """
+    Calculate an exact-target quadratic penalty for token retention.
+    
+    Loss = alpha * (expected_retained_ratio - target_ratio)^2
+    
+    This provides a persistent two-sided gradient pushing the model's soft retention
+    towards the curriculum target. Because it is an exact-target penalty rather than
+    a strict floor, retention will naturally oscillate around the target.
+    """
+    # Compute in float32 to prevent AMP overflow/access-violation bugs on Windows
+    expected_f32 = expected_retained_ratio.to(torch.float32)
+    target_f32 = torch.as_tensor(target_ratio, device=expected_f32.device, dtype=torch.float32)
+    loss_f32 = alpha * torch.square(expected_f32 - target_f32)
+    return loss_f32.to(expected_retained_ratio.dtype)
+
+
+
 def calculate_hidden_state_distillation_loss(
     student_hidden: torch.Tensor,
     teacher_hidden: torch.Tensor,
