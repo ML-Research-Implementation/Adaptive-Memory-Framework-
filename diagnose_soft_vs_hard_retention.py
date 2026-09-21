@@ -42,29 +42,70 @@ def _safe_mean(values):
     return sum(values) / max(len(values), 1)
 
 
+def _protected_count_from_result(result):
+    """Return the total number of protected tokens across the batch.
+
+    The production TokenSelectionResult exposes ``raw_protected_counts`` which
+    holds *gates-that-fired AND were protected* (i.e. not the total protected
+    token count).  We use ``actual_valid_counts`` (total valid) minus
+    ``raw_valid_retained_counts`` (valid tokens that the raw gate kept) as an
+    approximation only when ``raw_protected_counts`` is available and populated.
+
+    If ``raw_protected_counts`` is None (e.g. an older model version), we
+    report the count as unavailable (0) so the diagnostic still runs.
+    """
+    rpc = getattr(result, "raw_protected_counts", None)
+    if rpc is None:
+        return 0, False
+    return int(rpc.detach().long().sum().item()), True
+
+
 def _layer_record(result, threshold_biases):
+    """Collect per-layer statistics from a single TokenSelectionResult.
+
+    Uses only fields that are guaranteed by the current production
+    TokenSelectionResult definition.  Fields that may be None are guarded.
+    """
     scores = result.retention_scores.detach().float()
     probabilities = result.retention_probs.detach().float()
-    valid_counts = result.actual_valid_counts.detach().long()
-    protected_counts = result.raw_protected_counts.detach().long()
-    valid_mask = result.selected_valid_mask.detach().bool()
+
+    # actual_valid_counts: per-example count of valid (non-padding) tokens.
+    # Set by both the training and inference paths of TokenSelector.
+    avc = getattr(result, "actual_valid_counts", None)
+    if avc is not None:
+        valid_counts = avc.detach().long()
+    else:
+        # Fall back: use attention mask shape (seq_len) as a conservative proxy.
+        valid_counts = torch.full(
+            (scores.shape[0],), scores.shape[1], dtype=torch.long, device=scores.device
+        )
+
+    # selected_valid_mask may be None on very old checkpoints.
+    svm = getattr(result, "selected_valid_mask", None)
+    if svm is not None:
+        valid_mask = svm.detach().bool()
+    else:
+        valid_mask = torch.ones_like(scores, dtype=torch.bool)
+
+    protected_total, protected_available = _protected_count_from_result(result)
 
     hard_mask_at_zero = scores > 0.0
     valid_score_values = []
     valid_probability_values = []
     hard_zero_count = 0
     valid_total = 0
-    protected_total = int(protected_counts.sum().item())
     soft_ratios = []
     threshold_counts = {bias: 0 for bias in threshold_biases}
+
     for row, prob_row, valid_row, count in zip(scores, probabilities, valid_mask, valid_counts):
-        valid_positions = valid_row.nonzero(as_tuple=False).reshape(-1)
         count_value = int(count.item())
-        # selected_valid_mask contains the compacted valid positions in the
-        # inference result. For the diagnostic's direct hard-vs-soft comparison,
-        # use the original scorer tensor and the attention-valid prefix/count.
+        # Use the attention-valid prefix by count when the valid_mask refers to
+        # the compacted (post-selection) sequence rather than the original.
         if count_value < row.numel():
             valid_positions = torch.arange(count_value, device=row.device)
+        else:
+            valid_positions = valid_row.nonzero(as_tuple=False).reshape(-1)
+
         valid_scores = row[valid_positions]
         valid_probs = prob_row[valid_positions]
         valid_score_values.append(valid_scores)
@@ -86,7 +127,11 @@ def _layer_record(result, threshold_biases):
         "hard_retention": hard_retention,
         "hard_minus_soft": hard_retention - soft_retention,
         "valid_tokens": valid_total,
+        # protected_tokens: count of tokens that the gate independently marked
+        # as retained AND that were protected (CLS/SEP).  May be 0 if the
+        # attribute is unavailable (older checkpoints).
         "protected_tokens": protected_total,
+        "protected_tokens_available": protected_available,
         "hard_zero_count": hard_zero_count,
         "threshold_counts": threshold_counts,
         "threshold_fractions": {
@@ -150,10 +195,10 @@ def run_diagnostic(args):
     print("Production hard gate: z = (retention_logit + threshold_bias > 0).float()")
     print("Production HardConcreteGate inference: no noise, no sigmoid threshold, threshold bias applied to logits")
     print("Production training soft retention: mean over valid sigmoid(logit) per example, then mean across batch")
-    print("Protected tokens are counted separately; padding is excluded from all retention fractions.")
+    print("Protected tokens (raw_protected_counts): gates-fired AND protected tokens; may be 0 if unavailable.")
 
     print("\nPER-LAYER AGGREGATES")
-    print("layer | score min/mean/max/std | prob min/mean/max | soft | hard@0 | hard-soft | valid | protected | logit>0 | logit<=0")
+    print("layer | score min/mean/max/std | prob min/mean/max | soft | hard@0 | hard-soft | valid | protected* | logit>0 | logit<=0")
     aggregate = {}
     for layer_idx in sorted(layer_records):
         records = layer_records[layer_idx]
@@ -168,12 +213,15 @@ def run_diagnostic(args):
         hard = _safe_mean([row["hard_retention"] for row in records])
         valid = sum(row["valid_tokens"] for row in records)
         protected = sum(row["protected_tokens"] for row in records)
+        protected_avail = any(row["protected_tokens_available"] for row in records)
         positive = sum(row["hard_zero_count"] for row in records)
         aggregate[layer_idx] = {"soft": soft, "hard": hard, "gap": hard - soft}
+        protected_str = str(protected) if protected_avail else "N/A"
         print(f"{layer_idx} | {score_min:.5f}/{score_mean:.5f}/{score_max:.5f}/{score_std:.5f} | "
               f"{prob_min:.5f}/{prob_mean:.5f}/{prob_max:.5f} | {soft:.5f} | {hard:.5f} | "
-              f"{hard-soft:.5f} | {valid} | {protected} | {positive / max(valid, 1):.5f} | {1 - positive / max(valid, 1):.5f}")
+              f"{hard-soft:.5f} | {valid} | {protected_str} | {positive / max(valid, 1):.5f} | {1 - positive / max(valid, 1):.5f}")
 
+    print("\n* protected = raw_protected_counts (gates-fired & protected); 0 or N/A if unavailable.")
     print("\nHYPOTHETICAL THRESHOLD SENSITIVITY")
     print("layer | " + " | ".join(f"bias={bias:g}" for bias in args.threshold_biases))
     for layer_idx in sorted(layer_records):
