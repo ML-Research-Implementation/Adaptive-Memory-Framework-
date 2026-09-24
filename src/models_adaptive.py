@@ -613,9 +613,15 @@ class AdaptiveDistilBertQA(nn.Module):
             # --------------------------------------------------------
             if self.apply_retention_per_layer[layer_idx]:
                 diagnostic_target_counts = None
-                read_q = getattr(self, "_diagnostic_target_counts_read", None)
-                if read_q is not None and len(read_q) > 0:
-                    diagnostic_target_counts = read_q.pop(0)
+                diagnostic_batch_id = kwargs.get("diagnostic_batch_id", None)
+                if diagnostic_batch_id is not None:
+                    key = (diagnostic_batch_id, layer_idx)
+                    read_q = getattr(self, "_diagnostic_target_counts_read", None)
+                    if read_q is not None:
+                        diagnostic_target_counts = read_q.get(key, None)
+                        consumed_q = getattr(self, "_diagnostic_target_counts_consumed", None)
+                        if consumed_q is not None:
+                            consumed_q.add(key)
 
                 scores, _ = self.retention_scorers[
                     layer_idx
@@ -640,9 +646,11 @@ class AdaptiveDistilBertQA(nn.Module):
                     )
                 )
                 
-                write_q = getattr(self, "_diagnostic_target_counts_write", None)
-                if write_q is not None:
-                    write_q.append(selection_result.actual_retained_counts.detach().cpu())
+                if diagnostic_batch_id is not None:
+                    write_q = getattr(self, "_diagnostic_target_counts_write", None)
+                    if write_q is not None:
+                        key = (diagnostic_batch_id, layer_idx)
+                        write_q[key] = selection_result.actual_retained_counts.detach().cpu()
 
                 # Update hidden states.
                 hidden_states = (
