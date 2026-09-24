@@ -139,7 +139,8 @@ class TokenSelector:
         attention_mask: torch.Tensor,
         training: bool = True,
         threshold_bias: float = 0.0,
-        minimum_retention_ratio: float = 0.0
+        minimum_retention_ratio: float = 0.0,
+        diagnostic_no_compaction: bool = False
     ) -> TokenSelectionResult:
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -259,9 +260,6 @@ class TokenSelector:
 
         # ------------------------------------------------------------
         # 5. Continuous gating for gradient flow.
-        # The hard keep mask above is the computational guarantee; lifting
-        # selected tokens to gate value 1 also prevents the scorer's soft
-        # signal from collapsing below the active curriculum floor.
         # ------------------------------------------------------------
         floor_gate = torch.full_like(z, float(minimum_retention_ratio))
         floor_gate = torch.where(valid_tokens, floor_gate, torch.zeros_like(floor_gate))
@@ -270,7 +268,7 @@ class TokenSelector:
         gated_hidden = hidden_states * z.unsqueeze(-1)
 
         # ------------------------------------------------------------
-        # 6. Preserve original token ordering
+        # 6. Preserve original token ordering or bypass compaction
         # ------------------------------------------------------------
         indices = torch.arange(
             seq_len,
@@ -281,54 +279,55 @@ class TokenSelector:
             -1
         )
 
-        sort_keys = (
-            indices
-            + (~keep_mask).long() * 10000
-        )
+        if diagnostic_no_compaction:
+            selected_indices = indices
+            selected_hidden_states = gated_hidden * keep_mask.unsqueeze(-1).to(gated_hidden.dtype)
+            new_attention_mask = attention_mask * keep_mask.to(attention_mask.dtype)
+            actual_max_retained = seq_len
+        else:
+            sort_keys = (
+                indices
+                + (~keep_mask).long() * 10000
+            )
 
-        _, sorted_indices = torch.sort(
-            sort_keys,
-            dim=1
-        )
+            _, sorted_indices = torch.sort(
+                sort_keys,
+                dim=1
+            )
 
-        selected_indices = sorted_indices[
-            :, :max_retained
-        ]
+            selected_indices = sorted_indices[
+                :, :max_retained
+            ]
 
-        # ------------------------------------------------------------
-        # 7. Gather selected hidden states
-        # ------------------------------------------------------------
-        expanded_indices = (
-            selected_indices
-            .unsqueeze(-1)
-            .expand(-1, -1, hidden_dim)
-        )
+            expanded_indices = (
+                selected_indices
+                .unsqueeze(-1)
+                .expand(-1, -1, hidden_dim)
+            )
 
-        selected_hidden_states = torch.gather(
-            gated_hidden,
-            1,
-            expanded_indices
-        )
+            selected_hidden_states = torch.gather(
+                gated_hidden,
+                1,
+                expanded_indices
+            )
 
-        # ------------------------------------------------------------
-        # 8. Update attention mask
-        # ------------------------------------------------------------
-        new_attention_mask = torch.gather(
-            attention_mask,
-            1,
-            selected_indices
-        )
+            new_attention_mask = torch.gather(
+                attention_mask,
+                1,
+                selected_indices
+            )
 
-        is_retained = torch.gather(
-            keep_mask,
-            1,
-            selected_indices
-        )
+            is_retained = torch.gather(
+                keep_mask,
+                1,
+                selected_indices
+            )
 
-        new_attention_mask = (
-            new_attention_mask
-            * is_retained.to(new_attention_mask.dtype)
-        )
+            new_attention_mask = (
+                new_attention_mask
+                * is_retained.to(new_attention_mask.dtype)
+            )
+            actual_max_retained = max_retained
 
         result = TokenSelectionResult(
             selected_indices=selected_indices,
@@ -336,7 +335,7 @@ class TokenSelector:
             new_attention_mask=new_attention_mask,
             retention_scores=retention_scores,
             retention_probs=l0_penalty,
-            num_selected=max_retained,
+            num_selected=actual_max_retained,
             num_original=seq_len
         )
         result.actual_retained_counts = retained_counts.detach()
@@ -344,9 +343,13 @@ class TokenSelector:
         result.floor_added_counts = (retained_counts - raw_retained_counts).detach()
         result.topk_repair_activated = bool(torch.any(result.floor_added_counts > 0).item())
         result.actual_valid_counts = valid_tokens.sum(dim=1).detach()
-        result.selected_valid_mask = torch.gather(
-            valid_tokens, 1, selected_indices
-        ).detach()
+        
+        if diagnostic_no_compaction:
+            result.selected_valid_mask = valid_tokens.detach()
+        else:
+            result.selected_valid_mask = torch.gather(
+                valid_tokens, 1, selected_indices
+            ).detach()
         result.minimum_retention_ratio = float(floor)
         result.differentiable_training = False
         return result
@@ -452,7 +455,8 @@ class AdaptiveDistilBertQA(nn.Module):
         threshold_bias: float = 0.0,
         minimum_retention_ratio: Optional[float] = None,
         answer_span_mask: Optional[torch.Tensor] = None,
-        return_original_selection: bool = False
+        return_original_selection: bool = False,
+        diagnostic_no_compaction: bool = False
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -574,7 +578,8 @@ class AdaptiveDistilBertQA(nn.Module):
                         attention_mask=current_attention_mask,
                         training=training,
                         threshold_bias=threshold_bias,
-                        minimum_retention_ratio=minimum_retention_ratio
+                        minimum_retention_ratio=minimum_retention_ratio,
+                        diagnostic_no_compaction=diagnostic_no_compaction
                     )
                 )
 
