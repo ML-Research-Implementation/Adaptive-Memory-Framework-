@@ -86,5 +86,42 @@ class TestEvaluationCheckpoint(unittest.TestCase):
         self.assertTrue(DEFAULT_FINAL_CHECKPOINT.endswith("squad_final_checkpoint.pt"))
 
 
+    def test_verify_loaded_model_handles_different_original_lengths(self):
+        from evaluate_squad import verify_loaded_model
+
+        class FakeResult:
+            def __init__(self, indices, original, selected, ratio):
+                self.selected_indices = indices
+                self.num_original = original
+                self.num_selected = selected
+                self.retention_ratio = ratio
+
+        class FakeModel:
+            def __init__(self, results):
+                self.results = results
+            def eval(self):
+                pass
+            def get_retention_scorers(self):
+                class Scorer:
+                    def named_parameters(self):
+                        return [("0.weight", torch.tensor([1.0]))]
+                return Scorer()
+            def __call__(self, ids, mask, return_layer_metrics=True, training=False):
+                return (None, None, {"selection_results": self.results})
+
+        fresh_indices = torch.tensor([[0, 2, 4]])
+        fresh_result = FakeResult(fresh_indices, 10, 3, 0.3)
+        fresh = FakeModel([fresh_result])
+
+        loaded_indices = torch.tensor([[0, 2]])
+        loaded_result = FakeResult(loaded_indices, 8, 2, 0.25)
+        loaded = FakeModel([loaded_result])
+
+        dataloader = [{"input_ids": torch.tensor([[1, 2, 3]]), "attention_mask": torch.tensor([[1, 1, 1]])}]
+
+        stats = verify_loaded_model(fresh, loaded, dataloader, batches=1)
+        self.assertEqual(stats["different_masks"], 1)
+        self.assertEqual(stats["mask_comparisons"], 1)
+
 if __name__ == "__main__":
     unittest.main()
