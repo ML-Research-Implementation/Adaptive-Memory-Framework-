@@ -646,7 +646,7 @@ class AdaptiveDistilBertQA(nn.Module):
                     )
                 )
                 
-                if diagnostic_batch_id is not None:
+                if diagnostic_batch_id is not None and not diagnostic_force_all_retain and diagnostic_random_seed is None:
                     write_q = getattr(self, "_diagnostic_target_counts_write", None)
                     if write_q is not None:
                         key = (diagnostic_batch_id, layer_idx)

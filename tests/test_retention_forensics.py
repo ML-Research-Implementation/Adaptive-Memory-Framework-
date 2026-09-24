@@ -285,6 +285,36 @@ class TestRetentionForensics(unittest.TestCase):
         )
         self.assertNotEqual(res_rand.selected_indices.tolist(), res_rand3.selected_indices.tolist())
 
+    def test_diagnostic_random_seed_respects_target_count(self):
+        selector = TokenSelector()
+        hidden_states = torch.randn(2, 5, 4)
+        retention_scores = torch.tensor([[10.0, 10.0, -10.0, -10.0, -10.0], [10.0, -10.0, -10.0, -10.0, -10.0]])
+        protected_mask = torch.tensor([[True, False, False, False, False], [True, False, False, False, False]])
+        attention_mask = torch.tensor([[1, 1, 1, 1, 0], [1, 1, 1, 1, 1]])
+
+        # Test diagnostic_target_counts: force exactly 2 tokens to be kept in example 0, and 3 in example 1
+        target_counts = torch.tensor([2, 3])
+        
+        res = selector.select_adaptive(
+            hidden_states=hidden_states,
+            retention_scores=retention_scores,
+            protected_mask=protected_mask,
+            attention_mask=attention_mask,
+            training=False,
+            threshold_bias=0.0,
+            minimum_retention_ratio=0.0,
+            diagnostic_random_seed=42,
+            diagnostic_target_counts=target_counts
+        )
+
+        # Example 0: valid=4. Target=2. Keep exactly 2.
+        self.assertEqual(int(res.actual_retained_counts[0].item()), 2)
+        # Example 1: valid=5. Target=3. Keep exactly 3.
+        self.assertEqual(int(res.actual_retained_counts[1].item()), 3)
+        
+        # Test that padding is not selected (example 0, index 4)
+        self.assertNotIn(4, res.selected_indices[0].tolist())
+
 if __name__ == "__main__":
     unittest.main()
 
