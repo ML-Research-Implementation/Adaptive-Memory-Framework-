@@ -101,6 +101,19 @@ class TestRetentionForensics(unittest.TestCase):
         self.assertLess(selected2, selected1)
         self.assertLess(raw_selected2, raw_selected1)
 
+    def test_diagnostic_sweep_defaults_and_accounting(self):
+        import diagnose_soft_vs_hard_retention as diag
+        parser = diag.build_parser()
+        args = parser.parse_args(["--checkpoint", "dummy.pt"])
+        expected_biases = [0.00, -0.05, -0.10, -0.15, -0.20, -0.25, -0.30, -0.35, -0.40, -0.45, -0.50, -0.55, -0.60, -0.65, -0.70, -0.75, -0.80, -0.85, -0.90, -0.95, -1.00]
+        self.assertEqual(args.threshold_biases, expected_biases)
+        
+        with open("diagnose_soft_vs_hard_retention.py", encoding="utf-8") as handle:
+            source = handle.read()
+            
+        self.assertIn("PER-LAYER ACCOUNTING AUDIT", source)
+        self.assertIn("floor_req", source)
+
 if __name__ == "__main__":
     unittest.main()
 
