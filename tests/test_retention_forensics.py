@@ -220,6 +220,23 @@ class TestRetentionForensics(unittest.TestCase):
                 self.assertEqual(res_mask.new_attention_mask[0, i].item(), 0)
                 self.assertTrue(torch.all(res_mask.selected_hidden_states[0, i] == 0))
 
+    def test_diagnostic_force_all_retain_keeps_all_valid(self):
+        selector = TokenSelector(device=torch.device("cpu"))
+        hidden = torch.randn(1, 12, 4)
+        logits = torch.tensor([[-0.1, -0.1, -0.1, 0.1, 0.1, 0.1, -0.2, 0.2, 0.0, 0.0, 0.5, -0.5]])
+        protected = torch.zeros(1, 12, dtype=torch.bool)
+        attention = torch.ones(1, 12)
+        attention[0, 10:] = 0  # 2 padding tokens, so 10 valid
+        
+        res = selector.select_adaptive(
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.0, diagnostic_force_all_retain=True
+        )
+        
+        # Max retained sequence dimension should match valid tokens
+        self.assertEqual(res.selected_indices.shape[1], 10)
+        self.assertEqual(res.actual_retained_counts.item(), 10)
+        self.assertEqual(res.actual_valid_counts.item(), 10)
+        
 if __name__ == "__main__":
     unittest.main()
 

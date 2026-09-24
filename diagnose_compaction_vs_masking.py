@@ -43,18 +43,29 @@ def main():
     def wrapped_evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer, is_baseline=False, threshold_bias=0.0):
         original_forward = model.forward
         
+        total_actual_retained = 0
+        total_valid_original = 0
+        
         def new_forward(*args, **kwargs):
+            nonlocal total_actual_retained, total_valid_original
             kwargs["diagnostic_no_compaction"] = True
-            return original_forward(*args, **kwargs)
+            res = original_forward(*args, **kwargs)
+            if not is_baseline and len(res) == 3 and res[2] is not None:
+                for result in res[2].get("selection_results", []):
+                    if result is not None:
+                        total_actual_retained += int(result.actual_retained_counts.sum().item())
+                        total_valid_original += int(result.actual_valid_counts.sum().item())
+            return res
         
         model.forward = new_forward
         res = original_evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer, is_baseline, threshold_bias)
         model.forward = original_forward
         
-        # Verify compaction was bypassed:
-        # If bypassed, span_survival_rates shouldn't actually change because no tokens are removed from sequence length!
-        # wait, answer_survival might be 100% since indices are kept.
-        # Actually evaluate_model computes answer_survival based on result.selected_indices
+        if total_valid_original > 0:
+            res["effective_retention"] = (total_actual_retained / total_valid_original) * 100.0
+        else:
+            res["effective_retention"] = res["retention"]
+            
         return res
         
     evaluate_squad.evaluate_model = wrapped_evaluate_model
@@ -69,7 +80,7 @@ def main():
             "bias": bias,
             "EM": res["em"],
             "F1": res["f1"],
-            "effective_retention": res["retention"],
+            "effective_retention": res.get("effective_retention", res["retention"]),
             "answer_survival": res["answer_survival"]
         })
     
