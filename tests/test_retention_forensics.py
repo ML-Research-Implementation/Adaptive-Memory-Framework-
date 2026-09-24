@@ -236,7 +236,46 @@ class TestRetentionForensics(unittest.TestCase):
         self.assertEqual(res.selected_indices.shape[1], 10)
         self.assertEqual(res.actual_retained_counts.item(), 10)
         self.assertEqual(res.actual_valid_counts.item(), 10)
+
+    def test_diagnostic_random_seed_matches_count_and_protects(self):
+        selector = TokenSelector(device=torch.device("cpu"))
+        hidden = torch.randn(1, 12, 4)
+        logits = torch.tensor([[-0.1, -0.1, -0.1, 0.1, 0.1, 0.1, -0.2, 0.2, 0.0, 0.0, 0.5, -0.5]])
+        protected = torch.zeros(1, 12, dtype=torch.bool)
+        protected[0, 0] = True # e.g. CLS
+        attention = torch.ones(1, 12)
+        attention[0, 10:] = 0  # 2 padding tokens, so 10 valid
         
+        # Production run to get expected count
+        res_prod = selector.select_adaptive(
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5
+        )
+        prod_count = res_prod.actual_retained_counts.item()
+        
+        # Random run
+        res_rand = selector.select_adaptive(
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5, diagnostic_random_seed=42
+        )
+        rand_count = res_rand.actual_retained_counts.item()
+        
+        # 1. Matches count exactly
+        self.assertEqual(rand_count, prod_count)
+        
+        # 2. Padding is never selected
+        # selected_indices should not contain 10 or 11
+        selected = res_rand.selected_indices[0].tolist()
+        self.assertNotIn(10, selected[:rand_count])
+        self.assertNotIn(11, selected[:rand_count])
+        
+        # 3. Protected tokens remain protected
+        self.assertIn(0, selected[:rand_count])
+
+        # 4. Same seed gives same result
+        res_rand2 = selector.select_adaptive(
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5, diagnostic_random_seed=42
+        )
+        self.assertEqual(res_rand.selected_indices.tolist(), res_rand2.selected_indices.tolist())
+
 if __name__ == "__main__":
     unittest.main()
 

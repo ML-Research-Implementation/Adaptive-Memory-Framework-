@@ -141,7 +141,8 @@ class TokenSelector:
         threshold_bias: float = 0.0,
         minimum_retention_ratio: float = 0.0,
         diagnostic_no_compaction: bool = False,
-        diagnostic_force_all_retain: bool = False
+        diagnostic_force_all_retain: bool = False,
+        diagnostic_random_seed: Optional[int] = None
     ) -> TokenSelectionResult:
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -242,6 +243,36 @@ class TokenSelector:
         )
 
         pre_repair_counts = keep_mask.sum(dim=1).detach()
+        
+        if diagnostic_random_seed is not None:
+            # We want to match exactly the final count that the production mask WOULD have selected.
+            # First, calculate what the production mask count would be.
+            prod_final_counts = []
+            for batch_idx in range(batch_size):
+                cur = pre_repair_counts[batch_idx].item()
+                req = required_counts[batch_idx].item()
+                if cur >= req:
+                    prod_final_counts.append(cur)
+                else:
+                    cands = (valid_tokens[batch_idx] & ~keep_mask[batch_idx]).sum().item()
+                    prod_final_counts.append(cur + min(req - cur, cands))
+            
+            # Now reset keep_mask to ONLY the protected tokens (and never padding).
+            keep_mask = protected_mask.clone()
+            keep_mask = keep_mask & valid_tokens
+            
+            # Generate deterministic random scores to fill the remainder.
+            # We hash the hidden states sum to ensure reproducibility per layer
+            # but independence across layers.
+            layer_hash = int(hidden_states.detach().sum().item() * 10000) % 1000000
+            generator = torch.Generator(device=retention_scores.device)
+            generator.manual_seed(diagnostic_random_seed + layer_hash)
+            random_scores = torch.rand(retention_scores.shape, generator=generator, device=retention_scores.device, dtype=retention_scores.dtype)
+            
+            # Override required_counts to exactly match the production final count.
+            required_counts = torch.tensor(prod_final_counts, dtype=torch.long, device=required_counts.device)
+            pre_repair_counts = keep_mask.sum(dim=1).detach()
+            retention_scores = random_scores # use random scores for topk selection
         for batch_idx in range(batch_size):
             current_count = int(keep_mask[batch_idx].sum().item())
             required_count = min(int(required_counts[batch_idx].item()), int(valid_tokens[batch_idx].sum().item()))
@@ -461,7 +492,8 @@ class AdaptiveDistilBertQA(nn.Module):
         answer_span_mask: Optional[torch.Tensor] = None,
         return_original_selection: bool = False,
         diagnostic_no_compaction: bool = False,
-        diagnostic_force_all_retain: bool = False
+        diagnostic_force_all_retain: bool = False,
+        diagnostic_random_seed: Optional[int] = None
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -585,7 +617,8 @@ class AdaptiveDistilBertQA(nn.Module):
                         threshold_bias=threshold_bias,
                         minimum_retention_ratio=minimum_retention_ratio,
                         diagnostic_no_compaction=diagnostic_no_compaction,
-                        diagnostic_force_all_retain=diagnostic_force_all_retain
+                        diagnostic_force_all_retain=diagnostic_force_all_retain,
+                        diagnostic_random_seed=diagnostic_random_seed
                     )
                 )
 
