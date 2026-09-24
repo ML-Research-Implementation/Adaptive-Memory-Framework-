@@ -23,13 +23,20 @@ def evaluate_with_flag(model, val_dl, val_features, val_data, tokenizer, flag_na
     total_selected = 0
     
     if flag_name is None:
+        # Production AMMR pass: enable capture
         model._diagnostic_target_counts_write = []
         model._diagnostic_target_counts_read = None
     elif flag_name == "diagnostic_random_seed":
-        model._diagnostic_target_counts_read = list(model._diagnostic_target_counts_write) if hasattr(model, "_diagnostic_target_counts_write") else []
-        model._diagnostic_target_counts_write = None
+        # Random pass: consume captured counts
+        if getattr(model, "_diagnostic_target_counts_write", None) is None:
+            raise RuntimeError("Matched-retention random control requires a populated production target-count queue.")
+        if len(model._diagnostic_target_counts_write) == 0:
+            raise RuntimeError("Matched-retention random control requires a populated production target-count queue.")
+            
+        model._diagnostic_target_counts_read = list(model._diagnostic_target_counts_write)
+        # We don't overwrite _write, so it stays there for subsequent random seeds
     else:
-        model._diagnostic_target_counts_write = None
+        # Don't destroy _write, just ensure we aren't reading
         model._diagnostic_target_counts_read = None
         
     def new_forward(*args, **kwargs):
@@ -51,10 +58,25 @@ def evaluate_with_flag(model, val_dl, val_features, val_data, tokenizer, flag_na
     res = evaluate_squad.evaluate_model(model, val_dl, val_features, val_data, tokenizer, is_baseline=False, threshold_bias=bias)
     model.forward = original_forward
     
+    if flag_name is None:
+        assert model._diagnostic_target_counts_write is not None, "Target-count write queue is None after AMMR pass"
+        assert len(model._diagnostic_target_counts_write) > 0, "Target-count write queue is empty after AMMR pass"
+    elif flag_name == "diagnostic_random_seed":
+        assert model._diagnostic_target_counts_read is not None
+        assert len(model._diagnostic_target_counts_read) == 0, f"Random control did not consume all target counts! Remaining: {len(model._diagnostic_target_counts_read)}"
+    
     res["total_valid"] = total_valid
     res["total_selected"] = total_selected
     res["effective_retention"] = (total_selected / total_valid) * 100.0 if total_valid > 0 else 100.0
     
+    if flag_name is None:
+        res["target_count_records_captured"] = len(model._diagnostic_target_counts_write)
+    elif flag_name == "diagnostic_random_seed":
+        initial = len(model._diagnostic_target_counts_write)
+        remaining = len(model._diagnostic_target_counts_read)
+        res["target_count_records_consumed"] = initial - remaining
+        res["target_count_records_remaining"] = remaining
+        
     return res
 
 def main():
@@ -106,9 +128,10 @@ def main():
     
     print("\n" + "="*85)
     print("INVARIANT CHECK:")
-    print(f"Production total selected: {res_ammr['total_selected']}")
-    print(f"Random total selected (seed {seeds[0]}): {random_results[0]['total_selected']}")
-    print(f"Mismatch count: {abs(res_ammr['total_selected'] - random_results[0]['total_selected'])}")
+    print(f"target_count_records_captured: {res_ammr.get('target_count_records_captured', 'N/A')}")
+    print(f"target_count_records_consumed: {random_results[0].get('target_count_records_consumed', 'N/A')}")
+    print(f"target_count_records_remaining: {random_results[0].get('target_count_records_remaining', 'N/A')}")
+    print(f"Mismatch count (tokens): {abs(res_ammr['total_selected'] - random_results[0]['total_selected'])}")
     print("="*85)
     
     print("\nDIAGNOSTIC RESULTS: MATCHED-RETENTION RANDOM CONTROL")
