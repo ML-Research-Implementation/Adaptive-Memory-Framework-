@@ -22,6 +22,16 @@ def evaluate_with_flag(model, val_dl, val_features, val_data, tokenizer, flag_na
     total_valid = 0
     total_selected = 0
     
+    if flag_name is None:
+        model._diagnostic_target_counts_write = []
+        model._diagnostic_target_counts_read = None
+    elif flag_name == "diagnostic_random_seed":
+        model._diagnostic_target_counts_read = list(model._diagnostic_target_counts_write) if hasattr(model, "_diagnostic_target_counts_write") else []
+        model._diagnostic_target_counts_write = None
+    else:
+        model._diagnostic_target_counts_write = None
+        model._diagnostic_target_counts_read = None
+        
     def new_forward(*args, **kwargs):
         nonlocal total_valid, total_selected
         if flag_name:
@@ -85,6 +95,7 @@ def main():
         res_rand = evaluate_with_flag(model, val_dl, val_features, val_data, tokenizer, "diagnostic_random_seed", bias=0.0, seed_val=seed)
         
         # Verify matched retention
+        print(f"  [Invariant] target_selected={res_ammr['total_selected']} random_selected={res_rand['total_selected']}")
         assert res_rand['total_selected'] == res_ammr['total_selected'], \
             f"Random selection didn't match count! {res_rand['total_selected']} vs {res_ammr['total_selected']}"
             
@@ -92,6 +103,13 @@ def main():
         
     rand_ems = [r['em'] for r in random_results]
     rand_f1s = [r['f1'] for r in random_results]
+    
+    print("\n" + "="*85)
+    print("INVARIANT CHECK:")
+    print(f"Production total selected: {res_ammr['total_selected']}")
+    print(f"Random total selected (seed {seeds[0]}): {random_results[0]['total_selected']}")
+    print(f"Mismatch count: {abs(res_ammr['total_selected'] - random_results[0]['total_selected'])}")
+    print("="*85)
     
     print("\nDIAGNOSTIC RESULTS: MATCHED-RETENTION RANDOM CONTROL")
     print("-" * 85)
