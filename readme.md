@@ -1,195 +1,96 @@
-# AMMR — Adaptive Memory Retention for Transformer Networks
+# Adaptive Memory Framework (AMMR)
 
-## Project Overview
+AMMR is a **Differentiable Adaptive Gating** framework for accelerating Question Answering models (specifically DistilBERT) through dynamic, layer-wise token pruning. By learning which tokens to drop and which to retain at each transformer layer, AMMR drastically reduces attention computation cost during inference while maintaining high QA accuracy.
 
-**AMMR** learns which tokens are important for a Transformer model's task performance, enabling selective token retention. This reduces computational cost (quadratic attention complexity) while preserving model accuracy.
+## Key Features
 
-**Key Idea:** Instead of keeping all tokens or using binary pruning, AMMR learns soft probabilistic importance scores for each token (0-1 range), allowing fine-grained control over memory-computation trade-offs.
+- **Layer-wise Retention Mechanism**: Tokens are dynamically pruned at each layer, reducing the sequence length progressively.
+- **Differentiable Hard-Concrete Gating**: Uses stochastic Hard-Concrete gates during training for valid gradient flow, and fast deterministic binary decisions during inference.
+- **Teacher-Student Distillation**: 
+  - **Logit KD**: T-scaled KL divergence matching the teacher's start/end logits.
+  - **Hidden State KD**: Token-aligned Mean Squared Error (MSE) matching the teacher's hidden states.
+- **Dynamic Budget Tracking**: Employs a dual-gradient Lagrangian multiplier to dynamically penalize token retention when it exceeds a targeted schedule (e.g., a curriculum that steps down from 95% to 60%).
+- **Percentile-based Calibration**: Automatically finds the perfect gating bias threshold via percentile analysis to hit exact target retention budgets (e.g., 70%, 80%) on a validation subset.
+- **Mixed Precision Training**: Fully optimized with PyTorch AMP and AdamW for rapid experimentation.
 
-**Task:** Question Answering (DistilBERT on SQuAD-like data)
+## What We Have Implemented So Far
 
-**Approach:** 
-- Load frozen DistilBERT baseline
-- Extract hidden representations 
-- Train learnable RetentionScorer (small MLP) to predict token importance
-- Use multi-objective loss: QA accuracy + budget constraint + probability sharpness
+The project has been implemented in a structured, multi-phase approach:
 
----
+1. **Phase 1: Baseline Setup**
+   - Established the baseline `BaselineQAModel` using standard HuggingFace DistilBERT.
+   - Built the SQuAD preprocessing pipeline (`src/squad_data.py`).
+2. **Phase 2: Layer-Wise Token Retention**
+   - Implemented `AdaptiveDistilBertQA` with custom `TokenSelector` to dynamically prune tokens at each of the 6 transformer layers.
+   - Built indexing mechanisms to map compacted hidden states back to original positions for the final QA head.
+3. **Phase 3: Stabilization & Checkpointing**
+   - Refactored multiple legacy scripts into a unified, stable `train.py`.
+   - Built a fully reproducible checkpointing system (`save_checkpoint`/`load_checkpoint`) covering model weights, optimizer states, scheduler states, epoch, step, and Lagrangian variables.
+4. **Phase 4: Teacher-Student Distillation**
+   - Separated the frozen DistilBERT teacher from the trainable student retention scorers.
+   - Implemented multi-objective Knowledge Distillation ($L_{QA} + L_{LogitKD} + L_{HiddenKD}$) using T-scaled KL divergence and token-aligned MSE.
+5. **Phase 5: Differentiable Gating & Evaluation (Current State)**
+   - Replaced non-differentiable Top-K selection with **Hard-Concrete Gating** (Gumbel-Softmax formulation).
+   - Built a dynamic **Dual-Gradient Lagrangian penalty** that enforces target token budgets during training.
+   - Created `evaluate_squad.py` with an automated percentile-based calibration function to exactly match efficiency targets.
+   - Added `run_ablations.py` to seamlessly execute and compare KD variants.
+   - Implemented comprehensive unit tests for core components.
 
-## Current Implementation Progress
+## Setup
 
-### ✅ Phase 1: Baseline Architecture
-- **config.py** - Centralized hyperparameters
-- **src/data.py** - Base tokenization, answer span location, token masking
-- **src/models.py** - Initial RetentionScorer (importance predictor) & SoftRetentionGate
-- **src/baseline.py** - DistilBERT wrapper, hidden state extraction
+1. Install dependencies (PyTorch, Transformers, Datasets, tqdm).
+2. Ensure you have the `rajpurkar/squad` dataset available (it will be downloaded automatically via HuggingFace).
 
-### ✅ Phase 2: Layer-wise Physical Token Pruning
-- **src/models_adaptive.py** - `TokenSelector` implementing discrete layer-wise Top-K selection. Enables *actual* tensor compaction (e.g. 31 → 24 → 19 tokens).
-- **src/losses.py** - Multi-objective loss formulation (QA + Budget + Entropy).
-- **src/training_layerwise.py** - `LayerwiseAdaptiveTrainer` for jointly training the 6 layer-wise retention scorers alongside the QA objective.
-- **test_batching.py** - Verified index sorting, logit reconstruction via `scatter_`, and exact tensor shape preservation during deterministic Top-K pruning.
+## Usage
 
-### ✅ Phase 3: SQuAD Dataset & Batched Evaluation
-- **src/squad_data.py** - Robust data pipeline utilizing Hugging Face `datasets`. Incorporates standard SQuAD token-mapping, handling truncated sliding windows (`doc_stride`).
-- **train_squad.py** - Batched training script over SQuAD dataset subsets.
-- **evaluate_squad.py** - Baseline vs. AMMR comparative evaluation logic for extracting validation Exact Match (EM), F1 Score, Latency, and Estimated Attention Costs across configured retention ratios.
+### 1. Training the Adaptive Model
 
-### ❌ Next Steps (Phase 4 & 5)
-- **Stochastic Relaxation (Phase 4):** Swap deterministic Top-K with differentiable Hard-Concrete / Gumbel-Softmax gating to enable backpropagation through the index selection.
-- **Full Dataset Training (Phase 5):** End-to-end training over the entire 87k SQuAD training dataset with stochastic gating.
+To train the AMMR student model using the frozen DistilBERT teacher, run the unified training script:
 
----
-
-## How to Test
-
-### Quick Test: Full Pipeline
 ```bash
-cd d:\Adaptive-Memory-Framework-
-python main.py
+python train.py --epochs 5 --max_train_samples 10000 --batch_size 16
 ```
 
-Runs 11 steps:
-1. Load model → 2. Prepare data → 3. Locate answer → 4. Baseline prediction
-5. Extract hidden states → 6. Create masks → 7. Initialize scorer
-8. Train scorer (500 steps) → 9. Analyze tokens → 10. Predict with retention → 11. Report
+**Key Arguments:**
+- `--epochs`: Number of training epochs (Curriculum will scale automatically).
+- `--max_train_samples`: Number of training samples to use.
+- `--batch_size`: Training batch size.
+- `--learning_rate`: AdamW learning rate (default: 3e-3).
+- `--resume_from`: Path to a checkpoint to resume training gracefully.
 
-**Expected**: Completes in 2-5 minutes (CPU) or 30-60 sec (GPU), shows token rankings and training progress.
+### 2. Evaluation & Calibration
 
-### Run Examples
+The evaluation script automatically calibrates the model to exact retention thresholds (e.g. 50%, 60%, 70%, 80%) and generates an accuracy-efficiency Pareto curve compared against the baseline.
+
 ```bash
-python examples.py
+python evaluate_squad.py
 ```
 
-### Individual Component Tests
-```python
-# Test data loading
-from src import QADataLoader
-loader = QADataLoader()
-tokens = loader.get_tokens(loader.tokenize_qa("What is AI?", "AI is..."))
+*This will generate `calibration.json` storing the exact threshold biases calculated for your checkpoint.*
 
-# Test baseline model
-from src import BaselineQAModel
-baseline = BaselineQAModel(freeze_parameters=True)
-hidden, layers = baseline.get_hidden_states(input_ids, attention_mask, return_all_layers=True)
+### 3. Ablation Studies
 
-# Test retention scorer
-from src import RetentionScorer
-scorer = RetentionScorer(hidden_dimension=768)
-scores, probs = scorer(hidden_states)
+To automatically train and evaluate architectural variants (QA-Only, Logit-KD Only, and Full-KD), use the ablation runner:
 
-# Test losses
-from src import calculate_combined_loss
-loss, details = calculate_combined_loss(qa_loss, budget_loss, entropy_loss)
-
-# Test training
-from src import train_retention_scorer
-trainer, results = train_retention_scorer(scorer, qa_model, hidden_states, ...)
-
-# Test analysis
-from src import RetentionAnalyzer
-analyzer = RetentionAnalyzer(tokens, probs, protected_mask, valid_mask)
-analyzer.print_summary()
-ranking = analyzer.get_token_ranking()
+```bash
+python run_ablations.py
 ```
 
----
+Add the `--test` flag for a rapid dry-run on a tiny subset of data to verify the pipeline.
 
-## Key Results: Accuracy-Efficiency Trade-off (Phase 3)
+### 4. Running Unit Tests
 
-After implementing batched physical token pruning and training our `RetentionScorer` modules on a small SQuAD subset, we ran evaluations across uniform retention schedules (`r = 0.9` to `0.5`). 
+The core components (Hard-Concrete gates, Token Selection, Lagrangian budgets) are backed by unit tests. Run them using:
 
-| Model / Ratio | Exact Match | F1 Score | Tokens Retained | Attn Cost (est) | Latency/batch |
-| --- | --- | --- | --- | --- | --- |
-| Baseline | 75.00 | 82.26 | 100.0% | 100.0% | 1579.61 ms |
-| AMMR (r=0.90) | 22.00 | 27.15 | 89.9% | 80.8% | 1752.91 ms |
-| AMMR (r=0.80) | 10.00 | 13.05 | 79.8% | 63.7% | 1288.76 ms |
-| AMMR (r=0.70) | 0.00 | 0.26 | 69.8% | 48.8% | 1188.23 ms |
-| AMMR (r=0.60) | 0.00 | 0.76 | 59.9% | 35.8% | 898.80 ms |
-| AMMR (r=0.50) | 0.00 | 0.44 | 50.0% | 25.0% | 743.73 ms |
-
-### Explanation of Results
-
-1. **Efficiency Gains Achieved:** 
-   The model effectively speeds up sequence processing. At a 50% retention limit, the average CPU latency drops from ~1.58s to ~0.74s, representing over a **50% speedup**. Additionally, the estimated Attention Cost—which scales quadratically $O(N^2)$—drops by a massive **75%**. Note that at $r=0.9$, latency is slightly higher than the baseline due to the non-fused PyTorch overhead of running `top-k` and `scatter_` operations on small sequences.
-
-2. **Accuracy Degradation:**
-   As seen in the table, Exact Match and F1 crash heavily even at a 90% retention ratio. Why? Because the `torch.topk` physical selection is a **discrete, non-differentiable operation**. While the model trains, the loss gradients cannot flow back through the index selection step to tell the scorers which "dropped" tokens should have been retained. 
-
-**Next Step (Phase 4):** To resolve the accuracy drop, we will implement **Stochastic Relaxation** (Hard-Concrete / Gumbel-Softmax gating), making the token pruning operation mathematically differentiable.
-
----
-
-## Documentation
-
-- **TESTING_GUIDE.md** - Comprehensive testing with 4 levels + debugging
-- **IMPLEMENTATION_SUMMARY.md** - Detailed feature list and architecture
-- **PROJECT_STRUCTURE.md** - File layout and module overview
-- **README_MODULAR.md** - Deep architecture explanation
-- **QUICKREF.md** - Quick lookup and code patterns
-- **REFACTORING_GUIDE.md** - How we refactored from monolithic code
-
----
-
-## Architecture at a Glance
-
-```
-Question & Context
-       ↓
-QADataLoader (tokenize, locate answer, create masks)
-       ↓
-BaselineQAModel (frozen DistilBERT)
-       ↓
-Extract Hidden States (31 × 768)
-       ↓
-RetentionScorer (small MLP)
-       ↓
-Soft Gating: h'_t = p_t * h_t
-       ↓
-Train (500 steps, 3-loss objective)
-       ↓
-Analyze (token ranking, statistics)
-       ↓
-Predict with retained representation
+```bash
+python -m unittest tests/test_components.py
 ```
 
----
+## Architecture Details
 
-## Getting Started
-
-1. **Validate setup**: `python main.py` (or `python test_imports.py`)
-2. **Understand code**: Read QUICKREF.md for patterns
-3. **Modify settings**: Edit config.py (hyperparameters)
-4. **Extend**: Add new components in src/ and export via src/__init__.py
-
----
-
-## Status: ✅ Phase 3 Complete, Proceeding to Phase 4
-
-All foundational and data components are working. The framework currently successfully compacts layers physically in batches but suffers from missing gradients due to deterministic Top-K operation. We are now preparing to implement stochastic Hard-Concrete pruning (Phase 4).
-
-
-### ✅ Phase 4: SQuAD Training with Distillation & Lagrangian Budget
-- **src/stochastic_gating.py** — Differentiable Hard-Concrete / Gumbel-Softmax gating modules.
-- **train_squad.py** — End-to-end batched training loop across the full 87,599 SQuAD training dataset with periodic checkpointing and cache management.
-- **models/layerwise_scorers_phase4.pt** — Serialized weight checkpoint of trained layer-wise retention scorers.
-- **Pareto Sweep Evaluation** — Validation across threshold biases demonstrating preserved QA accuracy under aggressive token pruning.
-
----
-
-## 📊 Benchmark Results: Accuracy vs. Efficiency (Phase 4)
-
-Evaluated on the SQuAD validation set across multiple threshold biases ($b$):
-
-| Model Variant / Bias | Exact Match (EM) | F1 Score | Tokens Retained (%) | Attention Compute Ratio (est.) | Latency / Batch |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Baseline (DistilBERT)** | **73.50** | **82.11** | 100.0% | 100.0% | 11.08 ms |
-| **AMMR ($b=0.0$)** | 68.50 | 75.64 | **56.8%** | **32.3%** | 201.14 ms |
-| **AMMR ($b=-1.0$)** | 67.00 | 73.68 | 54.8% | 30.1% | 166.02 ms |
-| **AMMR ($b=-2.0$)** | 66.50 | 73.85 | 52.9% | 28.0% | 182.54 ms |
-| **AMMR ($b=-4.0$)** | 58.50 | 67.05 | 50.3% | 25.3% | 179.54 ms |
-
-### Key Findings:
-1. **~68% Attention Compute Reduction:** At default bias ($b=0.0$), the model drops **43.2%** of input tokens dynamically, reducing theoretical attention computation to **32.3%**.
-2. **High Task Accuracy Retention:** Exact Match remains at **68.50%** (within 5.0 points of baseline) despite retaining only slightly more than half of the input tokens.
-3. **Controllable Pareto Frontier:** Sweeping threshold bias ($b \in [0.0, -4.0]$) allows adjusting compression levels for constrained computational environments.
+1. **Input**: Sequence of tokens (e.g., 384 length).
+2. **Layer `L`**: The sequence passes through the transformer layer.
+3. **Retention Scorer**: A lightweight linear layer scores each token.
+4. **Token Selector**: Retains tokens where $Logits + Bias > 0$. Special tokens (`[CLS]`, `[SEP]`) are always protected.
+5. **Compaction**: The sequence is physically compacted, padding is removed, and the reduced sequence is passed to Layer `L+1`.
+6. **Reconstruction**: At the final QA head, the sequence is scattered back to its original length using index preservation, allowing the standard cross-entropy QA loss to function identically to the baseline.
