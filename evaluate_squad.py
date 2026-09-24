@@ -165,6 +165,10 @@ def verify_loaded_model(fresh, loaded, dataloader, batches=2):
     total = 0
     fresh_ratios = []
     loaded_ratios = []
+    fresh_originals = []
+    loaded_originals = []
+    fresh_selecteds = []
+    loaded_selecteds = []
     with torch.no_grad():
         for batch in dataloader:
             if total >= batches:
@@ -180,17 +184,35 @@ def verify_loaded_model(fresh, loaded, dataloader, batches=2):
                     continue
                 fresh_indices = fresh_result.selected_indices
                 loaded_indices = loaded_result.selected_indices
+
                 fresh_mask = torch.zeros(
                     fresh_indices.size(0), fresh_result.num_original,
                     dtype=torch.bool, device=fresh_indices.device
                 )
-                loaded_mask = torch.zeros_like(fresh_mask)
+                loaded_mask = torch.zeros(
+                    loaded_indices.size(0), loaded_result.num_original,
+                    dtype=torch.bool, device=loaded_indices.device
+                )
+
                 fresh_mask.scatter_(1, fresh_indices, True)
                 loaded_mask.scatter_(1, loaded_indices, True)
-                differences += int(torch.any(fresh_mask != loaded_mask).item())
+
+                if fresh_mask.size() == loaded_mask.size():
+                    differences += int(torch.any(fresh_mask != loaded_mask).item())
+                else:
+                    differences += 1
                 total += 1
                 fresh_ratios.append(fresh_result.retention_ratio)
                 loaded_ratios.append(loaded_result.retention_ratio)
+                fresh_originals.append(float(fresh_result.num_original))
+                loaded_originals.append(float(loaded_result.num_original))
+                fresh_selecteds.append(float(fresh_result.num_selected))
+                loaded_selecteds.append(float(loaded_result.num_selected))
+
+    print(f"Fresh original length: {sum(fresh_originals) / max(1, len(fresh_originals)):.4f}")
+    print(f"Loaded original length: {sum(loaded_originals) / max(1, len(loaded_originals)):.4f}")
+    print(f"Fresh selected count: {sum(fresh_selecteds) / max(1, len(fresh_selecteds)):.4f}")
+    print(f"Loaded selected count: {sum(loaded_selecteds) / max(1, len(loaded_selecteds)):.4f}")
     print(f"Fresh retention ratio: {sum(fresh_ratios) / max(1, len(fresh_ratios)):.4f}")
     print(f"Loaded retention ratio: {sum(loaded_ratios) / max(1, len(loaded_ratios)):.4f}")
     print(f"Different mask batches: {differences} / {total}")
