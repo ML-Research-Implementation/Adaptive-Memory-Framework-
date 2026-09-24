@@ -251,10 +251,11 @@ class TestRetentionForensics(unittest.TestCase):
             hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5
         )
         prod_count = res_prod.actual_retained_counts.item()
-        
-        # Random run
+        # Random run (pass target_count via diagnostic_target_counts)
+        target_counts = torch.tensor([prod_count], dtype=torch.long)
         res_rand = selector.select_adaptive(
-            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5, diagnostic_random_seed=42
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5, 
+            diagnostic_random_seed=42, diagnostic_target_counts=target_counts
         )
         rand_count = res_rand.actual_retained_counts.item()
         
@@ -272,9 +273,17 @@ class TestRetentionForensics(unittest.TestCase):
 
         # 4. Same seed gives same result
         res_rand2 = selector.select_adaptive(
-            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5, diagnostic_random_seed=42
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5, 
+            diagnostic_random_seed=42, diagnostic_target_counts=target_counts
         )
         self.assertEqual(res_rand.selected_indices.tolist(), res_rand2.selected_indices.tolist())
+        
+        # 5. Different seed gives different result
+        res_rand3 = selector.select_adaptive(
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.5, 
+            diagnostic_random_seed=123, diagnostic_target_counts=target_counts
+        )
+        self.assertNotEqual(res_rand.selected_indices.tolist(), res_rand3.selected_indices.tolist())
 
 if __name__ == "__main__":
     unittest.main()
