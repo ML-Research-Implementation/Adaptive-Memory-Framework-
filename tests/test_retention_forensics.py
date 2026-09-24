@@ -95,7 +95,11 @@ class TestRetentionForensics(unittest.TestCase):
         selected1 = result1.actual_retained_counts.item()
         selected2 = result2.actual_retained_counts.item()
         
+        raw_selected1 = result1.raw_retained_counts.sum().item()
+        raw_selected2 = result2.raw_retained_counts.sum().item()
+        
         self.assertLess(selected2, selected1)
+        self.assertLess(raw_selected2, raw_selected1)
 
 if __name__ == "__main__":
     unittest.main()
