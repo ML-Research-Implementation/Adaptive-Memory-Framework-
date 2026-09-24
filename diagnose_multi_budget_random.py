@@ -105,6 +105,11 @@ def evaluate_with_fresh_model(checkpoint, num_examples, batch_size, flag_name, b
         res["missing_records"] = len(missing_keys)
         res["extra_records"] = len(extra_keys)
         
+        assert len(missing_keys) == 0, f"Random control did not consume all target counts! Remaining: {len(missing_keys)}"
+        assert len(extra_keys) == 0, f"Random control consumed unknown target counts! Extra: {len(extra_keys)}"
+        
+    return res
+
 import csv
 
 def main():
@@ -142,6 +147,9 @@ def main():
             print(f"\n======================================")
             print(f"Evaluating AMMR Learned Selection (bias={bias})...")
             res_ammr = evaluate_with_fresh_model(args.checkpoint, args.num_examples, args.batch_size, None, bias=bias)
+            
+            assert res_ammr.get("target_counts") is not None, "AMMR target_counts is None. Target-count capture failed."
+            assert len(res_ammr["target_counts"]) > 0, f"Captured 0 target-count records!"
             
             random_results = []
             target_counts = res_ammr["target_counts"]
