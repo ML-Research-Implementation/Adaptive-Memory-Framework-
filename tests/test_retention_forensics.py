@@ -188,6 +188,38 @@ class TestRetentionForensics(unittest.TestCase):
         except IndexError as e:
             self.fail(f"run_diagnostic raised IndexError indicating accounting shape mismatch: {e}")
 
+    def test_diagnostic_no_compaction_retains_sequence_length(self):
+        selector = TokenSelector(device=torch.device("cpu"))
+        hidden = torch.randn(1, 12, 4)
+        logits = torch.tensor([[-0.1, -0.1, -0.1, 0.1, 0.1, 0.1, -0.2, 0.2, 0.0, 0.0, 0.5, -0.5]])
+        protected = torch.zeros(1, 12, dtype=torch.bool)
+        attention = torch.ones(1, 12)
+        
+        # With normal compaction, sequence length shrinks
+        res_compact = selector.select_adaptive(
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.0, diagnostic_no_compaction=False
+        )
+        # With diagnostic_no_compaction=True, sequence length remains original
+        res_mask = selector.select_adaptive(
+            hidden, logits, protected, attention, training=False, minimum_retention_ratio=0.0, diagnostic_no_compaction=True
+        )
+        
+        # Max retained sequence dimension
+        self.assertLess(res_compact.selected_indices.shape[1], 12)
+        self.assertEqual(res_mask.selected_indices.shape[1], 12)
+        self.assertEqual(res_mask.selected_hidden_states.shape[1], 12)
+        
+        # Even though sequence didn't shrink physically, actual_retained_counts must still match exactly
+        self.assertEqual(res_mask.actual_retained_counts.item(), res_compact.actual_retained_counts.item())
+        
+        # The unselected tokens in hidden_states should be zeroed
+        # And attention mask should have zeroes where dropped
+        retained = res_mask.selected_valid_mask[0]
+        for i in range(12):
+            if not retained[i]:
+                self.assertEqual(res_mask.new_attention_mask[0, i].item(), 0)
+                self.assertTrue(torch.all(res_mask.selected_hidden_states[0, i] == 0))
+
 if __name__ == "__main__":
     unittest.main()
 
