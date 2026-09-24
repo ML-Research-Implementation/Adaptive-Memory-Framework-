@@ -503,7 +503,8 @@ class AdaptiveDistilBertQA(nn.Module):
         return_original_selection: bool = False,
         diagnostic_no_compaction: bool = False,
         diagnostic_force_all_retain: bool = False,
-        diagnostic_random_seed: Optional[int] = None
+        diagnostic_random_seed: Optional[int] = None,
+        diagnostic_batch_id: Optional[int] = None
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -613,7 +614,6 @@ class AdaptiveDistilBertQA(nn.Module):
             # --------------------------------------------------------
             if self.apply_retention_per_layer[layer_idx]:
                 diagnostic_target_counts = None
-                diagnostic_batch_id = kwargs.get("diagnostic_batch_id", None)
                 if diagnostic_batch_id is not None:
                     key = (diagnostic_batch_id, layer_idx)
                     read_q = getattr(self, "_diagnostic_target_counts_read", None)
