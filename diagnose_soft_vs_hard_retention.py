@@ -90,7 +90,6 @@ def run_diagnostic(args):
                     batch_raw_hard_selected = int(raw_gate[valid_mask_aligned].sum().item())
                     
                     floor_added = getattr(result, "floor_added_counts", torch.tensor(0)).sum().item()
-                    topk_added = floor_added
                     
                     if probs.numel() > 0:
                         batch_soft_sum = float(probs[valid_mask_aligned].mean().item())
@@ -110,7 +109,6 @@ def run_diagnostic(args):
                         "raw_hard_selected": batch_raw_hard_selected,
                         "floor_required": floor_required,
                         "floor_added": floor_added,
-                        "topk_added": topk_added,
                         "final_hard_selected": final_hard_selected,
                         "soft_retention": soft_retention,
                         "original_tokens": original_tokens * scores.shape[0]
@@ -123,7 +121,7 @@ def run_diagnostic(args):
     print(f"Checkpoint: {os.path.abspath(args.checkpoint)}")
     print(f"Target ratio: {target_ratio}")
     print(f"Examples: {examples_seen}\n")
-    print(f"{'bias':>6} | {'soft_ret':>8} | {'raw_hard_ret':>12} | {'final_hard_ret':>14} | {'gap':>8} | {'answer_survival':>15} | {'floor_added':>11} | {'topk_added':>10}")
+    print(f"{'bias':>6} | {'soft_ret':>8} | {'raw_hard_ret':>12} | {'final_hard_ret':>14} | {'gap':>8} | {'answer_survival':>15} | {'floor_added':>11}")
     print("-" * 105)
     for bias in args.threshold_biases:
         layer_metrics = bias_results[bias]["layers"]
@@ -136,9 +134,8 @@ def run_diagnostic(args):
         gap = final_hard - soft_ret
         span_surv = bias_results[bias]["span_survived"] / max(bias_results[bias]["span_total"], 1)
         floor_added = sum(l["floor_added"] for l in all_layers)
-        topk_added = sum(l["topk_added"] for l in all_layers)
         
-        print(f"{bias:>6.2f} | {soft_ret:>8.5f} | {raw_hard:>12.5f} | {final_hard:>14.5f} | {gap:>8.5f} | {span_surv:>14.2%} | {floor_added:>11} | {topk_added:>10}")
+        print(f"{bias:>6.2f} | {soft_ret:>8.5f} | {raw_hard:>12.5f} | {final_hard:>14.5f} | {gap:>8.5f} | {span_surv:>14.2%} | {floor_added:>11}")
         summary.append({
             "bias": bias,
             "soft_retention": soft_ret,
@@ -146,29 +143,28 @@ def run_diagnostic(args):
             "final_hard_retention": final_hard,
             "gap": gap,
             "answer_survival": span_surv,
-            "floor_added": floor_added,
-            "topk_added": topk_added
+            "floor_added": floor_added
         })
 
     print("\nPER-LAYER ACCOUNTING AUDIT")
     layer_indices = sorted(bias_results[args.threshold_biases[0]]["layers"].keys())
     for bias in args.threshold_biases:
         print(f"\n--- Threshold Bias: {bias:.2f} ---")
-        print(f"{'Layer':>5} | {'raw_sel':>8} | {'floor_req':>9} | {'floor_add':>9} | {'topk_add':>8} | {'final_sel':>9} | {'valid_toks':>10} | {'orig_toks':>9} | {'raw_ret%':>8} | {'final_ret%':>10}")
+        print(f"{'Layer':>5} | {'pre_rep':>8} | {'floor_req':>9} | {'floor_add':>9} | {'final_sel':>9} | {'valid_toks':>10} | {'orig_toks':>9} | {'pre_ret%':>8} | {'final_ret%':>10}")
         for l in layer_indices:
             data = bias_results[bias]["layers"][l]
-            raw_sel = sum(x["raw_hard_selected"] for x in data)
             floor_req = sum(x["floor_required"] for x in data)
             floor_add = sum(x["floor_added"] for x in data)
-            topk_add = sum(x["topk_added"] for x in data)
             final_sel = sum(x["final_hard_selected"] for x in data)
+            # Pre-repair selection is the final selection minus whatever the floor top-k repair added
+            pre_rep = final_sel - floor_add
             valid_toks = sum(x["valid_total"] for x in data)
             orig_toks = sum(x["original_tokens"] for x in data)
             
-            raw_ret = raw_sel / max(valid_toks, 1)
+            pre_ret = pre_rep / max(valid_toks, 1)
             final_ret = final_sel / max(valid_toks, 1)
             
-            print(f"{l:>5} | {raw_sel:>8} | {floor_req:>9} | {floor_add:>9} | {topk_add:>8} | {final_sel:>9} | {valid_toks:>10} | {orig_toks:>9} | {raw_ret:>8.1%} | {final_ret:>9.1%}")
+            print(f"{l:>5} | {pre_rep:>8} | {floor_req:>9} | {floor_add:>9} | {final_sel:>9} | {valid_toks:>10} | {orig_toks:>9} | {pre_ret:>8.1%} | {final_ret:>10.1%}")
 
     with open("threshold_sweep_results.json", "w") as f:
         json.dump(summary, f, indent=2)
