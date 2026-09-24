@@ -140,7 +140,8 @@ class TokenSelector:
         training: bool = True,
         threshold_bias: float = 0.0,
         minimum_retention_ratio: float = 0.0,
-        diagnostic_no_compaction: bool = False
+        diagnostic_no_compaction: bool = False,
+        diagnostic_force_all_retain: bool = False
     ) -> TokenSelectionResult:
 
         batch_size, seq_len, hidden_dim = hidden_states.shape
@@ -224,7 +225,10 @@ class TokenSelector:
         # ------------------------------------------------------------
         # 4. Deterministic binary keep mask with a hard minimum-retention floor.
         # ------------------------------------------------------------
-        keep_mask = z > 0
+        if diagnostic_force_all_retain:
+            keep_mask = valid_tokens.clone()
+        else:
+            keep_mask = z > 0
 
         # The curriculum target is a floor, not a soft preference. Select the
         # highest-scoring valid tokens until every example reaches the floor.
@@ -456,7 +460,8 @@ class AdaptiveDistilBertQA(nn.Module):
         minimum_retention_ratio: Optional[float] = None,
         answer_span_mask: Optional[torch.Tensor] = None,
         return_original_selection: bool = False,
-        diagnostic_no_compaction: bool = False
+        diagnostic_no_compaction: bool = False,
+        diagnostic_force_all_retain: bool = False
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -579,7 +584,8 @@ class AdaptiveDistilBertQA(nn.Module):
                         training=training,
                         threshold_bias=threshold_bias,
                         minimum_retention_ratio=minimum_retention_ratio,
-                        diagnostic_no_compaction=diagnostic_no_compaction
+                        diagnostic_no_compaction=diagnostic_no_compaction,
+                        diagnostic_force_all_retain=diagnostic_force_all_retain
                     )
                 )
 
