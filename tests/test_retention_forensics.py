@@ -315,6 +315,49 @@ class TestRetentionForensics(unittest.TestCase):
         # Test that padding is not selected (example 0, index 4)
         self.assertNotIn(4, res.selected_indices[0].tolist())
 
+    def test_multi_budget_pipeline(self):
+        # We test the end-to-end multi-budget diagnostic capture
+        import sys
+        import os
+        sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        
+        try:
+            from diagnose_multi_budget_random import evaluate_with_fresh_model
+            # Use dummy.pt if checkpoint not found
+            ckpt = "dummy.pt"
+            if not os.path.exists(ckpt):
+                # We need a valid model to test, just create a dummy
+                torch.save({}, ckpt)
+                
+            from unittest.mock import patch
+            with patch('diagnose_multi_budget_random.evaluate_squad.load_ammr_checkpoint'):
+                res_ammr = evaluate_with_fresh_model(
+                checkpoint=ckpt,
+                num_examples=2,
+                batch_size=2,
+                flag_name=None,
+                bias=0.0
+            )
+            
+            self.assertIsNotNone(res_ammr.get("target_counts"))
+            self.assertGreater(len(res_ammr["target_counts"]), 0)
+            
+            with patch('diagnose_multi_budget_random.evaluate_squad.load_ammr_checkpoint'):
+                res_rand = evaluate_with_fresh_model(
+                checkpoint=ckpt,
+                num_examples=2,
+                batch_size=2,
+                flag_name="diagnostic_random_seed",
+                bias=0.0,
+                seed_val=42,
+                target_counts_write=res_ammr["target_counts"]
+            )
+            
+            self.assertEqual(res_ammr["total_selected"], res_rand["total_selected"])
+            self.assertEqual(res_rand["missing_records"], 0)
+            self.assertEqual(res_rand["extra_records"], 0)
+        except Exception as e:
+            self.fail(f"Pipeline test failed: {e}")
+
 if __name__ == "__main__":
     unittest.main()
-
