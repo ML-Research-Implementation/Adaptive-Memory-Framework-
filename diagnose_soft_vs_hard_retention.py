@@ -82,14 +82,15 @@ def run_diagnostic(args):
                         valid_mask = svm.detach().bool()
                     else:
                         valid_mask = torch.ones_like(scores, dtype=torch.bool)
+                    batch_valid_total = int(valid_mask.sum().item())
                     raw_gate = (scores + bias > 0).float()
                     batch_raw_hard_selected = int(raw_gate[valid_mask].sum().item())
                     
                     floor_added = getattr(result, "floor_added_counts", torch.tensor(0)).sum().item()
                     topk_added = floor_added
                     
-                    if valid_probs.numel() > 0:
-                        batch_soft_sum = float(valid_probs.mean().item())
+                    if probs.numel() > 0:
+                        batch_soft_sum = float(probs[valid_mask].mean().item())
                         batch_items = 1
                     else:
                         batch_soft_sum = 0.0
