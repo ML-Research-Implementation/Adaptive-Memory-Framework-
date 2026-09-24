@@ -77,11 +77,12 @@ def run_diagnostic(args):
                         valid_counts = avc.detach().long()
                     else:
                         valid_counts = torch.full((scores.shape[0],), scores.shape[1], dtype=torch.long, device=scores.device)
-                    svm = getattr(result, "selected_valid_mask", None)
-                    if svm is not None:
-                        valid_mask = svm.detach().bool()
+                    if layer_idx == 0:
+                        valid_mask = attention_mask >= 0.5
                     else:
-                        valid_mask = torch.ones_like(scores, dtype=torch.bool)
+                        prev_result = metrics["selection_results"][layer_idx - 1]
+                        valid_mask = prev_result.new_attention_mask >= 0.5
+                        
                     batch_valid_total = int(valid_mask.sum().item())
                     raw_gate = (scores + bias > 0).float()
                     batch_raw_hard_selected = int(raw_gate[valid_mask].sum().item())

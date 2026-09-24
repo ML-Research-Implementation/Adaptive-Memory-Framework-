@@ -114,6 +114,76 @@ class TestRetentionForensics(unittest.TestCase):
         self.assertIn("PER-LAYER ACCOUNTING AUDIT", source)
         self.assertIn("floor_req", source)
 
+    @unittest.mock.patch('diagnose_soft_vs_hard_retention.os.path.isfile')
+    @unittest.mock.patch('diagnose_soft_vs_hard_retention.load_ammr_checkpoint')
+    @unittest.mock.patch('diagnose_soft_vs_hard_retention.get_squad_dataloaders')
+    @unittest.mock.patch('diagnose_soft_vs_hard_retention.AdaptiveDistilBertQA')
+    def test_diagnostic_accounting_handles_shrinking_sequences(self, mock_model_class, mock_dataloaders, mock_load_checkpoint, mock_isfile):
+        import diagnose_soft_vs_hard_retention as diag
+        mock_isfile.return_value = True
+        
+        # Mock dataloader yielding one batch of length 384
+        batch = {
+            "input_ids": torch.zeros((1, 384), dtype=torch.long),
+            "attention_mask": torch.ones((1, 384), dtype=torch.long),
+            "start_positions": torch.zeros(1, dtype=torch.long),
+            "end_positions": torch.zeros(1, dtype=torch.long),
+        }
+        mock_dataloaders.return_value = (None, [batch], None, None, None)
+        mock_load_checkpoint.return_value = {"target_ratio": 0.6}
+        
+        # Create a mock model instance
+        mock_model = unittest.mock.MagicMock()
+        mock_model.to.return_value = mock_model
+        mock_model.retention_schedule = [0.6]
+        mock_model_class.return_value = mock_model
+        
+        # Mock selection results: Layer 0 has length 384, Layer 1 has length 171
+        from src.models_adaptive import TokenSelectionResult
+        
+        res0 = TokenSelectionResult(
+            selected_indices=torch.zeros((1, 171), dtype=torch.long),
+            selected_hidden_states=torch.zeros(1, 171, 4),
+            new_attention_mask=torch.ones((1, 171), dtype=torch.long),
+            retention_scores=torch.ones((1, 384)),
+            retention_probs=torch.ones((1, 384)),
+            num_selected=171,
+            num_original=384
+        )
+        res0.actual_retained_counts = torch.tensor([171])
+        res0.raw_retained_counts = torch.tensor([171])
+        res0.floor_added_counts = torch.tensor([0])
+        res0.actual_valid_counts = torch.tensor([384])
+        res0.selected_valid_mask = torch.ones((1, 171), dtype=torch.bool)
+        
+        res1 = TokenSelectionResult(
+            selected_indices=torch.zeros((1, 100), dtype=torch.long),
+            selected_hidden_states=torch.zeros(1, 100, 4),
+            new_attention_mask=torch.ones((1, 100), dtype=torch.long),
+            retention_scores=torch.ones((1, 171)), # This is length 171, simulating the shrink!
+            retention_probs=torch.ones((1, 171)),
+            num_selected=100,
+            num_original=171
+        )
+        res1.actual_retained_counts = torch.tensor([100])
+        res1.raw_retained_counts = torch.tensor([100])
+        res1.floor_added_counts = torch.tensor([0])
+        res1.actual_valid_counts = torch.tensor([171])
+        res1.selected_valid_mask = torch.ones((1, 100), dtype=torch.bool)
+        
+        # Mock the forward pass output
+        metrics = {"selection_results": [res0, res1]}
+        # Model returns (start_logits, end_logits, metrics)
+        mock_model.return_value = (torch.zeros((1, 384)), torch.zeros((1, 384)), metrics)
+        
+        parser = diag.build_parser()
+        args = parser.parse_args(["--checkpoint", "dummy.pt", "--num-examples", "1", "--threshold-biases", "0.00"])
+        
+        try:
+            diag.run_diagnostic(args)
+        except IndexError as e:
+            self.fail(f"run_diagnostic raised IndexError indicating accounting shape mismatch: {e}")
+
 if __name__ == "__main__":
     unittest.main()
 
