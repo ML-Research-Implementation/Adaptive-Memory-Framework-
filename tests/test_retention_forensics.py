@@ -122,12 +122,16 @@ class TestRetentionForensics(unittest.TestCase):
         import diagnose_soft_vs_hard_retention as diag
         mock_isfile.return_value = True
         
+        import torch
+        device_1 = torch.device('cpu')
+        device_2 = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+        
         # Mock dataloader yielding one batch of length 384
         batch = {
-            "input_ids": torch.zeros((1, 384), dtype=torch.long),
-            "attention_mask": torch.ones((1, 384), dtype=torch.long),
-            "start_positions": torch.zeros(1, dtype=torch.long),
-            "end_positions": torch.zeros(1, dtype=torch.long),
+            "input_ids": torch.zeros((1, 384), dtype=torch.long, device=device_2),
+            "attention_mask": torch.ones((1, 384), dtype=torch.long, device=device_2),
+            "start_positions": torch.zeros(1, dtype=torch.long, device=device_2),
+            "end_positions": torch.zeros(1, dtype=torch.long, device=device_2),
         }
         mock_dataloaders.return_value = (None, [batch], None, None, None)
         mock_load_checkpoint.return_value = {"target_ratio": 0.6}
@@ -142,34 +146,34 @@ class TestRetentionForensics(unittest.TestCase):
         from src.models_adaptive import TokenSelectionResult
         
         res0 = TokenSelectionResult(
-            selected_indices=torch.zeros((1, 171), dtype=torch.long),
-            selected_hidden_states=torch.zeros(1, 171, 4),
-            new_attention_mask=torch.ones((1, 171), dtype=torch.long),
-            retention_scores=torch.ones((1, 384)),
-            retention_probs=torch.ones((1, 384)),
+            selected_indices=torch.zeros((1, 171), dtype=torch.long, device=device_1),
+            selected_hidden_states=torch.zeros(1, 171, 4, device=device_1),
+            new_attention_mask=torch.ones((1, 171), dtype=torch.long, device=device_2),
+            retention_scores=torch.ones((1, 384), device=device_1),
+            retention_probs=torch.ones((1, 384), device=device_1),
             num_selected=171,
             num_original=384
         )
-        res0.actual_retained_counts = torch.tensor([171])
-        res0.raw_retained_counts = torch.tensor([171])
-        res0.floor_added_counts = torch.tensor([0])
-        res0.actual_valid_counts = torch.tensor([384])
-        res0.selected_valid_mask = torch.ones((1, 171), dtype=torch.bool)
+        res0.actual_retained_counts = torch.tensor([171], device=device_1)
+        res0.raw_retained_counts = torch.tensor([171], device=device_1)
+        res0.floor_added_counts = torch.tensor([0], device=device_1)
+        res0.actual_valid_counts = torch.tensor([384], device=device_1)
+        res0.selected_valid_mask = torch.ones((1, 171), dtype=torch.bool, device=device_1)
         
         res1 = TokenSelectionResult(
-            selected_indices=torch.zeros((1, 100), dtype=torch.long),
-            selected_hidden_states=torch.zeros(1, 100, 4),
-            new_attention_mask=torch.ones((1, 100), dtype=torch.long),
-            retention_scores=torch.ones((1, 171)), # This is length 171, simulating the shrink!
-            retention_probs=torch.ones((1, 171)),
+            selected_indices=torch.zeros((1, 100), dtype=torch.long, device=device_1),
+            selected_hidden_states=torch.zeros(1, 100, 4, device=device_1),
+            new_attention_mask=torch.ones((1, 100), dtype=torch.long, device=device_2),
+            retention_scores=torch.ones((1, 171), device=device_1), # This is length 171, simulating the shrink!
+            retention_probs=torch.ones((1, 171), device=device_1),
             num_selected=100,
             num_original=171
         )
-        res1.actual_retained_counts = torch.tensor([100])
-        res1.raw_retained_counts = torch.tensor([100])
-        res1.floor_added_counts = torch.tensor([0])
-        res1.actual_valid_counts = torch.tensor([171])
-        res1.selected_valid_mask = torch.ones((1, 100), dtype=torch.bool)
+        res1.actual_retained_counts = torch.tensor([100], device=device_1)
+        res1.raw_retained_counts = torch.tensor([100], device=device_1)
+        res1.floor_added_counts = torch.tensor([0], device=device_1)
+        res1.actual_valid_counts = torch.tensor([171], device=device_1)
+        res1.selected_valid_mask = torch.ones((1, 100), dtype=torch.bool, device=device_1)
         
         # Mock the forward pass output
         metrics = {"selection_results": [res0, res1]}

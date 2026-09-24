@@ -82,16 +82,18 @@ def run_diagnostic(args):
                     else:
                         prev_result = metrics["selection_results"][layer_idx - 1]
                         valid_mask = prev_result.new_attention_mask >= 0.5
+                    
+                    valid_mask_aligned = valid_mask.to(device=scores.device, dtype=torch.bool)
                         
                     batch_valid_total = int(valid_mask.sum().item())
                     raw_gate = (scores + bias > 0).float()
-                    batch_raw_hard_selected = int(raw_gate[valid_mask].sum().item())
+                    batch_raw_hard_selected = int(raw_gate[valid_mask_aligned].sum().item())
                     
                     floor_added = getattr(result, "floor_added_counts", torch.tensor(0)).sum().item()
                     topk_added = floor_added
                     
                     if probs.numel() > 0:
-                        batch_soft_sum = float(probs[valid_mask].mean().item())
+                        batch_soft_sum = float(probs[valid_mask_aligned].mean().item())
                         batch_items = 1
                     else:
                         batch_soft_sum = 0.0
