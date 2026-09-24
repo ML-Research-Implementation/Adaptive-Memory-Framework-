@@ -117,8 +117,9 @@ class TokenSelectionResult:
         self.minimum_retention_ratio: Optional[float] = None
         self.selected_valid_mask: Optional[torch.Tensor] = None
         self.selected_original_indices: Optional[torch.Tensor] = None
-
-
+        self.diagnostic_z: Optional[torch.Tensor] = None
+        self.diagnostic_gated_hidden: Optional[torch.Tensor] = None
+        self.diagnostic_hidden_states: Optional[torch.Tensor] = None
 class TokenSelector:
     """
     Handles adaptive token selection using Hard-Concrete gates.
@@ -388,6 +389,9 @@ class TokenSelector:
         result.floor_added_counts = (retained_counts - raw_retained_counts).detach()
         result.topk_repair_activated = bool(torch.any(result.floor_added_counts > 0).item())
         result.actual_valid_counts = valid_tokens.sum(dim=1).detach()
+        result.diagnostic_z = z.detach().clone()
+        result.diagnostic_gated_hidden = gated_hidden.detach().clone()
+        result.diagnostic_hidden_states = hidden_states.detach().clone()
         
         if diagnostic_no_compaction:
             result.selected_valid_mask = valid_tokens.detach()
@@ -504,7 +508,8 @@ class AdaptiveDistilBertQA(nn.Module):
         diagnostic_no_compaction: bool = False,
         diagnostic_force_all_retain: bool = False,
         diagnostic_random_seed: Optional[int] = None,
-        diagnostic_batch_id: Optional[int] = None
+        diagnostic_batch_id: Optional[int] = None,
+        diagnostic_return_layer_states: bool = False
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
@@ -524,7 +529,9 @@ class AdaptiveDistilBertQA(nn.Module):
             "expected_retained_tokens": torch.tensor(0.0, device=input_ids.device),
             "actual_retained_tokens": torch.tensor(0.0, device=input_ids.device),
             "actual_original_tokens": torch.tensor(0.0, device=input_ids.device),
-            "actual_retention_ratio": 1.0
+            "actual_retention_ratio": 1.0,
+            "layer_hidden_states": [],
+            "layer_attention_masks": [],
         }
         
         # Initialize queue for reading counts if random seed is set
@@ -555,6 +562,9 @@ class AdaptiveDistilBertQA(nn.Module):
         hidden_states = embedding_output
 
         current_attention_mask = attention_mask
+        
+        if diagnostic_return_layer_states:
+            layer_metrics["embedding_output"] = embedding_output.detach().clone()
 
         # ------------------------------------------------------------
         # Track original token positions
@@ -599,6 +609,10 @@ class AdaptiveDistilBertQA(nn.Module):
                 hidden_states = layer_output[0]
             else:
                 hidden_states = layer_output
+
+            if diagnostic_return_layer_states:
+                layer_metrics["layer_hidden_states"].append(hidden_states.detach().clone())
+                layer_metrics["layer_attention_masks"].append(current_attention_mask.detach().clone() if current_attention_mask is not None else None)
 
             # --------------------------------------------------------
             # Record tokens before retention
@@ -807,6 +821,10 @@ class AdaptiveDistilBertQA(nn.Module):
             token_index_mapping,
             end_logits_final
         )
+
+        # Mask out padding tokens to ensure they never become the argmax
+        start_logits_padded.masked_fill_(~attention_mask.bool(), -100.0)
+        end_logits_padded.masked_fill_(~attention_mask.bool(), -100.0)
 
         # ============================================================
         # Return
