@@ -230,6 +230,11 @@ class TokenSelector:
         # ------------------------------------------------------------
         if diagnostic_force_all_retain:
             keep_mask = valid_tokens.clone()
+            z = torch.where(
+                valid_tokens,
+                torch.ones_like(z),
+                torch.zeros_like(z)
+            )
         else:
             keep_mask = z > 0
 
@@ -548,9 +553,6 @@ class AdaptiveDistilBertQA(nn.Module):
                 device=input_ids.device, dtype=torch.bool
             )
 
-        if minimum_retention_ratio is None:
-            minimum_retention_ratio = float(self.retention_schedule[0])
-        minimum_retention_ratio = max(0.0, min(1.0, float(minimum_retention_ratio)))
 
         # ------------------------------------------------------------
         # Embeddings
@@ -644,6 +646,11 @@ class AdaptiveDistilBertQA(nn.Module):
                     temperature=1.0
                 )
 
+                layer_min_ratio = minimum_retention_ratio
+                if layer_min_ratio is None:
+                    layer_min_ratio = float(self.retention_schedule[layer_idx])
+                layer_min_ratio = max(0.0, min(1.0, float(layer_min_ratio)))
+
                 selection_result = (
                     self.token_selector.select_adaptive(
                         hidden_states=hidden_states,
@@ -652,7 +659,7 @@ class AdaptiveDistilBertQA(nn.Module):
                         attention_mask=current_attention_mask,
                         training=training,
                         threshold_bias=threshold_bias,
-                        minimum_retention_ratio=minimum_retention_ratio,
+                        minimum_retention_ratio=layer_min_ratio,
                         diagnostic_no_compaction=diagnostic_no_compaction,
                         diagnostic_force_all_retain=diagnostic_force_all_retain,
                         diagnostic_random_seed=diagnostic_random_seed,
