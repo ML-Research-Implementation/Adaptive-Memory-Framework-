@@ -560,5 +560,38 @@ class TestRetentionForensics(unittest.TestCase):
         # Verify it writes to correct csv
         self.assertIn("multi_budget_random_control_full_squad.csv", content)
 
+    def test_threshold_bias_changes_selection_mask(self):
+        selector = TokenSelector(device=torch.device("cpu"))
+        hidden = torch.randn(1, 10, 4)
+        logits = torch.tensor([[-2.0, -1.0, 0.5, 1.5, -0.5, 2.0, -3.0, 0.1, -1.5, 1.0]])
+        protected = torch.zeros(1, 10, dtype=torch.bool)
+        attention = torch.ones(1, 10)
+        
+        # Bias = 0.0 -> threshold is 0.0. Logits > 0.0 are kept: idx 2, 3, 5, 7, 9 = 5 tokens
+        res_0 = selector.select_adaptive(hidden, logits, protected, attention, training=False, threshold_bias=0.0, minimum_retention_ratio=0.0)
+        
+        # Bias = -1.0 -> threshold is -1.0. Logits > 1.0 are kept: idx 3, 5 = 2 tokens
+        res_neg1 = selector.select_adaptive(hidden, logits, protected, attention, training=False, threshold_bias=-1.0, minimum_retention_ratio=0.0)
+        
+        # Bias = 1.0 -> threshold is 1.0. Logits > -1.0 are kept: idx 1, 2, 3, 4, 5, 7, 9 = 7 tokens
+        res_pos1 = selector.select_adaptive(hidden, logits, protected, attention, training=False, threshold_bias=1.0, minimum_retention_ratio=0.0)
+        
+        self.assertNotEqual(res_0.num_selected, res_neg1.num_selected)
+        self.assertNotEqual(res_0.num_selected, res_pos1.num_selected)
+
+    def test_identical_masks_detected(self):
+        selector = TokenSelector(device=torch.device("cpu"))
+        hidden = torch.randn(1, 10, 4)
+        # All logits highly positive
+        logits = torch.tensor([[10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]])
+        protected = torch.zeros(1, 10, dtype=torch.bool)
+        attention = torch.ones(1, 10)
+        
+        res_a = selector.select_adaptive(hidden, logits, protected, attention, training=False, threshold_bias=0.0, minimum_retention_ratio=0.0)
+        res_b = selector.select_adaptive(hidden, logits, protected, attention, training=False, threshold_bias=-1.0, minimum_retention_ratio=0.0)
+        
+        # Should be identical because logits are huge
+        self.assertTrue(torch.equal(res_a.selected_indices, res_b.selected_indices))
+
 if __name__ == "__main__":
     unittest.main()
