@@ -114,6 +114,13 @@ import csv
 
 def main():
     args = parse_args()
+    args.num_examples = None  # Force full SQuAD validation
+    
+    print("\n" + "!" * 80)
+    print("WARNING: This is a FULL SQuAD validation run.")
+    print("This will execute AMMR and 10 matched-random control seeds across all 10,570 validation examples.")
+    print("This is a significantly more expensive and time-consuming run than the 500-example diagnostic.")
+    print("!" * 80 + "\n")
     
     if not os.path.exists(args.checkpoint):
         if os.path.exists("dummy.pt"):
@@ -131,7 +138,7 @@ def main():
     del baseline
     torch.cuda.empty_cache()
     
-    biases = [1.0, 0.5, 0.2, 0.0, -0.2, -0.4, -0.6]
+    biases = [0.0, -0.2, -0.4, -0.6]
     seeds = [42, 123, 2026, 7, 19, 37, 101, 256, 512, 999]
     
     all_results = []
@@ -220,18 +227,18 @@ def main():
                 f"Target records consumed: {consumed}"
             ) from e
 
-    # Assert exactly 7 results
-    assert len(all_results) == 7, f"Expected 7 results, got {len(all_results)}"
+    # Assert exactly 4 results
+    assert len(all_results) == 4, f"Expected 4 results, got {len(all_results)}"
     
     # Assert exact bias set
     produced = {round(float(row["bias"]), 1) for row in all_results}
-    expected = {1.0, 0.5, 0.2, 0.0, -0.2, -0.4, -0.6}
+    expected = {0.0, -0.2, -0.4, -0.6}
     assert produced == expected, f"Produced biases {produced} do not match expected {expected}"
     
     # Sort descending
     all_results.sort(key=lambda x: x["bias"], reverse=True)
     
-    csv_filename = "multi_budget_random_control.csv"
+    csv_filename = "multi_budget_random_control_full_squad.csv"
     with open(csv_filename, "w", newline="") as f:
         writer = csv.writer(f)
         headers = [
