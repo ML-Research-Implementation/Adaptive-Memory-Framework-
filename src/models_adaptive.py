@@ -229,12 +229,11 @@ class TokenSelector:
         # 4. Deterministic binary keep mask with a hard minimum-retention floor.
         # ------------------------------------------------------------
         if diagnostic_force_all_retain:
-            keep_mask = valid_tokens.clone()
-            z = torch.where(
-                valid_tokens,
-                torch.ones_like(z),
-                torch.zeros_like(z)
-            )
+            # To be mathematically identical to ordinary DistilBert computation,
+            # we must retain EVERYTHING, including padding tokens, and set z=1.0 for EVERYTHING.
+            # Otherwise, zeroing padding tokens causes their layer outputs to diverge from the baseline!
+            keep_mask = torch.ones_like(valid_tokens)
+            z = torch.ones_like(z)
         else:
             keep_mask = z > 0
 
@@ -593,19 +592,33 @@ class AdaptiveDistilBertQA(nn.Module):
             attn_bias = None
 
             if current_attention_mask is not None:
-                attn_impl = getattr(self.distilbert.config, "_attn_implementation", "eager")
-                if attn_impl == "sdpa":
-                    try:
-                        from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
-                        attn_bias = _prepare_4d_attention_mask_for_sdpa(
-                            current_attention_mask, hidden_states.dtype, tgt_len=hidden_states.shape[1]
-                        )
-                    except ImportError:
-                        attn_bias = (1.0 - current_attention_mask[:, None, None, :]) * torch.finfo(hidden_states.dtype).min
-                elif attn_impl == "flash_attention_2":
-                    attn_bias = current_attention_mask if (0 in current_attention_mask) else None
-                else:
+                # Bulletproof HuggingFace mask interception: 
+                # Let DistilBertModel prepare the mask exactly as it wants for the current installed version,
+                # then intercept it right before it enters the transformer.
+                class MaskIntercept(Exception):
+                    def __init__(self, mask):
+                        self.mask = mask
+                
+                def hook_forward(*args, **kwargs):
+                    mask = kwargs.get("attn_mask", args[1] if len(args) > 1 else None)
+                    raise MaskIntercept(mask)
+                    
+                orig_forward = self.distilbert.transformer.forward
+                self.distilbert.transformer.forward = hook_forward
+                try:
+                    dummy_input_ids = torch.zeros((batch_size, current_attention_mask.shape[1]), dtype=torch.long, device=hidden_states.device)
+                    self.distilbert(
+                        input_ids=dummy_input_ids,
+                        attention_mask=current_attention_mask,
+                        output_hidden_states=False,
+                        return_dict=True
+                    )
                     attn_bias = current_attention_mask
+                except MaskIntercept as e:
+                    attn_bias = e.mask
+                finally:
+                    self.distilbert.transformer.forward = orig_forward
+
 
             # --------------------------------------------------------
             # Transformer layer
