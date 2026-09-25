@@ -215,8 +215,37 @@ def main():
     print("!" * 80 + "\n")
     
     if not os.path.exists(args.checkpoint):
-        if os.path.exists("dummy.pt"):
-            args.checkpoint = "dummy.pt"
+        raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
+        
+    print(f"Validating checkpoint: {args.checkpoint}")
+    import hashlib
+    sha = hashlib.sha256()
+    with open(args.checkpoint, 'rb') as f:
+        while True:
+            chunk = f.read(1024*1024)
+            if not chunk:
+                break
+            sha.update(chunk)
+    file_size = os.path.getsize(args.checkpoint)
+    print(f"  Size: {file_size} bytes")
+    print(f"  SHA256: {sha.hexdigest()}")
+    
+    ckpt_data = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
+    if not isinstance(ckpt_data, dict):
+        raise ValueError("Checkpoint is not a dictionary.")
+        
+    epoch = ckpt_data.get("epoch")
+    step = ckpt_data.get("step")
+    target_ratio = ckpt_data.get("target_ratio")
+    lam = ckpt_data.get("lagrangian_multiplier")
+    
+    print(f"  Epoch: {epoch}")
+    print(f"  Step: {step}")
+    print(f"  Target ratio: {target_ratio}")
+    print(f"  Lambda: {lam}")
+    
+    if step != 6365:
+        raise ValueError("WRONG CHECKPOINT FOR EXACT-TARGET EXPERIMENT. Expected step 6365.")
             
     print("Loading datasets and model once...")
     _, val_dl, _, val_data, val_features = get_squad_dataloaders(

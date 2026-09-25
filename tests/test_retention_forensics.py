@@ -4,6 +4,10 @@ from unittest.mock import patch
 
 import torch
 
+import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 from diagnose_retention_forensics import _layer_row, _parameter_stats, build_parser
 
 from src.models_adaptive import TokenSelector
