@@ -593,11 +593,19 @@ class AdaptiveDistilBertQA(nn.Module):
             attn_bias = None
 
             if current_attention_mask is not None:
-
-                attn_bias = (
-                    1.0
-                    - current_attention_mask[:, None, None, :]
-                ) * -1e9
+                attn_impl = getattr(self.distilbert.config, "_attn_implementation", "eager")
+                if attn_impl == "sdpa":
+                    try:
+                        from transformers.modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa
+                        attn_bias = _prepare_4d_attention_mask_for_sdpa(
+                            current_attention_mask, hidden_states.dtype, tgt_len=hidden_states.shape[1]
+                        )
+                    except ImportError:
+                        attn_bias = (1.0 - current_attention_mask[:, None, None, :]) * torch.finfo(hidden_states.dtype).min
+                elif attn_impl == "flash_attention_2":
+                    attn_bias = current_attention_mask if (0 in current_attention_mask) else None
+                else:
+                    attn_bias = current_attention_mask
 
             # --------------------------------------------------------
             # Transformer layer
