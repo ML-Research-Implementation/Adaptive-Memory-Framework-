@@ -359,5 +359,162 @@ class TestRetentionForensics(unittest.TestCase):
         except Exception as e:
             self.fail(f"Pipeline test failed: {e}")
 
+    def test_forced_all_retain_matches_baseline_first_layer(self):
+        # We need to strictly compare layer0 between baseline and forced-all-retain
+        # because the user reported MaxDiff = 1.699e+00 at layer0.
+        import torch
+        from config import MODEL_NAME, DEVICE
+        from src.baseline import BaselineQAModel
+        from src.models_adaptive import AdaptiveDistilBertQA
+        import os
+        
+        from src.squad_data import get_squad_dataloaders
+        _, val_dl, _, _, _ = get_squad_dataloaders(
+            batch_size=16,
+            max_train_samples=1,
+            max_val_samples=16,
+        )
+        batch = next(iter(val_dl))
+        input_ids = batch['input_ids'].to(DEVICE)
+        attention_mask = batch['attention_mask'].to(DEVICE)
+
+        baseline = BaselineQAModel(freeze_parameters=True).to(DEVICE)
+        adaptive = AdaptiveDistilBertQA(
+            model_name=MODEL_NAME, 
+            device=DEVICE,
+            apply_retention_per_layer=[True, True, True, True, True, True]
+        ).to(DEVICE)
+        
+        # We MUST ensure the weights match exactly
+        adaptive.distilbert.load_state_dict(baseline.model.distilbert.state_dict(), strict=False)
+        adaptive.qa_outputs.load_state_dict(baseline.model.qa_outputs.state_dict(), strict=False)
+
+        baseline.eval()
+        adaptive.eval()
+
+        with torch.no_grad():
+            out_b = baseline.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            baseline_hidden = out_b.hidden_states
+            
+            start_logits, end_logits, diagnostics = adaptive(
+                input_ids=input_ids, 
+                attention_mask=attention_mask, 
+                diagnostic_force_all_retain=True,
+                diagnostic_return_layer_states=True
+            )
+            
+        embed_diff = torch.abs(baseline_hidden[0] - diagnostics['embedding_output']).max().item()
+        layer0_diff = torch.abs(baseline_hidden[1] - diagnostics['layer_hidden_states'][0]).max().item()
+        
+        # If there's a divergence, it should fail here and report the value
+        self.assertEqual(embed_diff, 0.0, f"First divergence at embedding output: {embed_diff}")
+        self.assertEqual(layer0_diff, 0.0, f"First divergence at layer0 output: {layer0_diff}")
+
+    def test_matched_retention_random_seeds(self):
+        # Validate that running diagnostic_random_seed with multiple seeds
+        # produces deterministic behavior for the same seed, different behavior
+        # for different seeds, while exact counts match perfectly.
+        import torch
+        from config import MODEL_NAME, DEVICE
+        from src.models_adaptive import AdaptiveDistilBertQA
+        
+        torch.manual_seed(42)
+        model = AdaptiveDistilBertQA(model_name=MODEL_NAME, device=DEVICE).to(DEVICE)
+        model.eval()
+        
+        batch_size = 2
+        seq_len = 64
+        input_ids = torch.randint(0, 1000, (batch_size, seq_len)).to(DEVICE)
+        attention_mask = torch.ones((batch_size, seq_len)).to(DEVICE)
+        # Pretend it's a squad example with CLS/SEP protected
+        input_ids[:, 0] = 101
+        input_ids[:, -1] = 102
+        
+        # 1. AMMR Run (capturing target counts)
+        model._diagnostic_target_counts_write = {}
+        model._diagnostic_target_counts_read = None
+        model._diagnostic_target_counts_consumed = None
+        
+        with torch.no_grad():
+            _, _, metrics = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                diagnostic_batch_id=1,
+                training=False,
+                threshold_bias=0.0,
+                return_layer_metrics=True
+            )
+            
+        target_counts = dict(model._diagnostic_target_counts_write)
+        ammr_selections = []
+        for result in metrics.get("selection_results", []):
+            if result is not None:
+                ammr_selections.append(result.selected_indices.clone())
+                
+        # 2. Random Run Seed A
+        seeds = [42, 123, 2026, 7, 19, 37, 101, 256, 512, 999]
+        self.assertEqual(len(seeds), 10, "Should evaluate exactly 10 seeds")
+        
+        first_seed_selections = []
+        
+        for seed in seeds:
+            model._diagnostic_target_counts_write = dict(target_counts)
+            model._diagnostic_target_counts_read = dict(target_counts)
+            model._diagnostic_target_counts_consumed = set()
+            
+            with torch.no_grad():
+                _, _, rand_metrics = model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    diagnostic_batch_id=1,
+                    diagnostic_random_seed=seed,
+                    training=False,
+                    threshold_bias=0.0,
+                    return_layer_metrics=True
+                )
+                
+            # Verify exact count match for every layer
+            for i, result in enumerate(rand_metrics.get("selection_results", [])):
+                if result is not None:
+                    ammr_target = target_counts[(1, i)]
+                    self.assertTrue(torch.equal(result.actual_retained_counts.cpu(), ammr_target))
+            
+            # Verify consumption
+            self.assertEqual(len(model._diagnostic_target_counts_consumed), len(target_counts))
+            self.assertEqual(len(target_counts) - len(model._diagnostic_target_counts_consumed), 0)
+            
+            rand_selections = [r.selected_indices.clone() for r in rand_metrics.get("selection_results", []) if r is not None]
+            
+            if seed == seeds[0]:
+                first_seed_selections = rand_selections
+            elif seed == seeds[1]:
+                # Verify different seeds yield different selections
+                diff = False
+                for r1, r2 in zip(first_seed_selections, rand_selections):
+                    if not torch.equal(r1, r2):
+                        diff = True
+                        break
+                self.assertTrue(diff, "Different seeds should produce different selections")
+                
+        # Verify same seed yields deterministic result
+        model._diagnostic_target_counts_write = dict(target_counts)
+        model._diagnostic_target_counts_read = dict(target_counts)
+        model._diagnostic_target_counts_consumed = set()
+        
+        with torch.no_grad():
+            _, _, rand_metrics_deterministic = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                diagnostic_batch_id=1,
+                diagnostic_random_seed=seeds[0],
+                training=False,
+                threshold_bias=0.0,
+                return_layer_metrics=True
+            )
+            
+        deterministic_selections = [r.selected_indices.clone() for r in rand_metrics_deterministic.get("selection_results", []) if r is not None]
+        for r1, r2 in zip(first_seed_selections, deterministic_selections):
+            self.assertTrue(torch.equal(r1, r2), "Same seed should be deterministic")
+
 if __name__ == "__main__":
     unittest.main()

@@ -131,17 +131,24 @@ def main():
     del baseline
     torch.cuda.empty_cache()
     
-    biases = [1.0, 0.5, 0.2, 0.0, -0.2, -0.4, -0.6]
-    seeds = [42, 123, 2026]
+    biases = [0.2, -0.4, -0.6]
+    seeds = [42, 123, 2026, 7, 19, 37, 101, 256, 512, 999]
     
     csv_filename = "multi_budget_random_control.csv"
     with open(csv_filename, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow([
-            "bias",
-            "AMMR_EM", "AMMR_F1", "AMMR_eff_ret", "AMMR_ans_surv",
-            "Rand_mean_EM", "Rand_std_EM", "Rand_mean_F1", "Rand_std_F1", "Rand_eff_ret"
+        headers = [
+            "bias", "AMMR_EM", "AMMR_F1", "AMMR_eff_ret", "AMMR_ans_surv"
+        ]
+        for seed in seeds:
+            headers.append(f"Rand_EM_seed_{seed}")
+        for seed in seeds:
+            headers.append(f"Rand_F1_seed_{seed}")
+        headers.extend([
+            "Rand_mean_EM", "Rand_std_EM", "Rand_mean_F1", "Rand_std_F1", 
+            "Rand_eff_ret", "Rand_ans_surv", "EM_diff", "F1_diff"
         ])
+        writer.writerow(headers)
         
         for bias in biases:
             print(f"\n======================================")
@@ -159,38 +166,60 @@ def main():
                 res_rand = evaluate_with_fresh_model(args.checkpoint, args.num_examples, args.batch_size, "diagnostic_random_seed", bias=bias, seed_val=seed, target_counts_write=target_counts)
                 
                 # Verify matched retention
-                assert res_rand['total_selected'] == res_ammr['total_selected'], \
-                    f"Random selection didn't match count! {res_rand['total_selected']} vs {res_ammr['total_selected']}"
+                if res_rand['total_selected'] != res_ammr['total_selected']:
+                    raise AssertionError(f"Count Mismatch (bias={bias}, seed={seed})! Random selected {res_rand['total_selected']} != AMMR selected {res_ammr['total_selected']}")
+                if res_rand['missing_records'] > 0:
+                    raise AssertionError(f"Mismatch (bias={bias}, seed={seed})! missing_records={res_rand['missing_records']}")
+                if res_rand['extra_records'] > 0:
+                    raise AssertionError(f"Mismatch (bias={bias}, seed={seed})! extra_records={res_rand['extra_records']}")
                     
                 random_results.append(res_rand)
                 
             rand_ems = [r['em'] for r in random_results]
             rand_f1s = [r['f1'] for r in random_results]
+            rand_ans_survs = [r['answer_survival'] for r in random_results]
+            
+            mean_em = float(np.mean(rand_ems))
+            std_em = float(np.std(rand_ems))
+            mean_f1 = float(np.mean(rand_f1s))
+            std_f1 = float(np.std(rand_f1s))
+            mean_ans_surv = float(np.mean(rand_ans_survs))
+            em_diff = float(res_ammr['em']) - mean_em
+            f1_diff = float(res_ammr['f1']) - mean_f1
             
             print(f"\nINVARIANT CHECK for bias={bias}:")
             print(f"  target_count_records_captured: {res_ammr.get('target_count_records_captured', 'N/A')}")
             print(f"  target_count_records_consumed: {random_results[0].get('target_count_records_consumed', 'N/A')}")
-            print(f"  missing_records: {random_results[0].get('missing_records', 'N/A')}")
-            print(f"  extra_records: {random_results[0].get('extra_records', 'N/A')}")
-            print(f"  Mismatch count (tokens): {abs(res_ammr['total_selected'] - random_results[0]['total_selected'])}")
+            print(f"  missing_records: 0")
+            print(f"  extra_records: 0")
+            print(f"  Mismatch count (tokens): 0")
             
             print(f"\nRESULTS for bias={bias}:")
             print(f"  AMMR EM={res_ammr['em']:.2f}, F1={res_ammr['f1']:.2f}, EffRet={res_ammr['effective_retention']:.2f}%")
-            print(f"  Rand mean EM={np.mean(rand_ems):.2f}, std EM={np.std(rand_ems):.2f}")
-            print(f"  Rand mean F1={np.mean(rand_f1s):.2f}, std F1={np.std(rand_f1s):.2f}")
+            print(f"  Rand mean EM={mean_em:.2f}, std EM={std_em:.2f}")
+            print(f"  Rand mean F1={mean_f1:.2f}, std F1={std_f1:.2f}")
+            print(f"  EM diff={em_diff:.2f}, F1 diff={f1_diff:.2f}")
             
-            writer.writerow([
+            row = [
                 f"{bias:.1f}",
                 f"{res_ammr['em']:.2f}",
                 f"{res_ammr['f1']:.2f}",
                 f"{res_ammr['effective_retention']:.2f}",
                 f"{res_ammr['answer_survival']:.2f}",
-                f"{np.mean(rand_ems):.2f}",
-                f"{np.std(rand_ems):.2f}",
-                f"{np.mean(rand_f1s):.2f}",
-                f"{np.std(rand_f1s):.2f}",
-                f"{random_results[0]['effective_retention']:.2f}"
+            ]
+            row.extend([f"{em:.2f}" for em in rand_ems])
+            row.extend([f"{f1:.2f}" for f1 in rand_f1s])
+            row.extend([
+                f"{mean_em:.2f}",
+                f"{std_em:.2f}",
+                f"{mean_f1:.2f}",
+                f"{std_f1:.2f}",
+                f"{random_results[0]['effective_retention']:.2f}",
+                f"{mean_ans_surv:.2f}",
+                f"{em_diff:.2f}",
+                f"{f1_diff:.2f}"
             ])
+            writer.writerow(row)
             
     print(f"\nFinished. Results exported to {csv_filename}")
 
