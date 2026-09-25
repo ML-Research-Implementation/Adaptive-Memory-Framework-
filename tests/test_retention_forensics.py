@@ -516,5 +516,27 @@ class TestRetentionForensics(unittest.TestCase):
         for r1, r2 in zip(first_seed_selections, deterministic_selections):
             self.assertTrue(torch.equal(r1, r2), "Same seed should be deterministic")
 
+    def test_multi_budget_script_configuration(self):
+        # Verify the script's configured sweep contains exactly these seven biases
+        # without running the expensive evaluation.
+        import re
+        import os
+        
+        script_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "diagnose_multi_budget_random.py")
+        self.assertTrue(os.path.exists(script_path), "diagnose_multi_budget_random.py not found")
+        
+        with open(script_path, "r", encoding="utf-8") as f:
+            content = f.read()
+            
+        bias_match = re.search(r"biases\s*=\s*\[(.*?)\]", content)
+        self.assertIsNotNone(bias_match, "biases list not found in script")
+        
+        biases_str = bias_match.group(1)
+        # Parse the numbers out, handling negatives
+        biases_parsed = [float(b.strip()) for b in biases_str.split(",")]
+        
+        expected_biases = [1.0, 0.5, 0.2, 0.0, -0.2, -0.4, -0.6]
+        self.assertEqual(biases_parsed, expected_biases, "Configured biases do not match expected sweep")
+
 if __name__ == "__main__":
     unittest.main()
