@@ -548,17 +548,15 @@ class TestRetentionForensics(unittest.TestCase):
         with open(script_path, "r", encoding="utf-8") as f:
             content = f.read()
             
-        bias_match = re.search(r"biases\s*=\s*\[(.*?)\]", content)
+        bias_match = re.search(r"default=\[(.*?)\]", content)
         self.assertIsNotNone(bias_match, "biases list not found in full squad script")
         
         biases_str = bias_match.group(1)
         biases_parsed = [float(b.strip()) for b in biases_str.split(",")]
         
-        expected_biases = [0.0, -0.2, -0.4, -0.6]
+        expected_biases = [1.0, 0.5, 0.2, 0.0, -0.2, -0.4, -0.6]
         self.assertEqual(biases_parsed, expected_biases, "Configured biases do not match expected sweep in full squad script")
         
-        # Verify it uses args.num_examples = None
-        self.assertIn("args.num_examples = None", content)
         # Verify it writes to correct csv
         self.assertIn("multi_budget_random_control_full_squad.csv", content)
 

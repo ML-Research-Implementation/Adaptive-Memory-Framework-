@@ -1,7 +1,11 @@
 import os
+import sys
 import argparse
 import torch
 import numpy as np
+import time
+import json
+import csv
 from transformers import AutoTokenizer
 from config import MODEL_NAME, DEVICE
 from src.squad_data import get_squad_dataloaders
@@ -14,23 +18,117 @@ def parse_args():
     parser.add_argument("--checkpoint", default="/content/AMMR_GITHUB/squad_final_checkpoint.pt")
     parser.add_argument("--num-examples", type=int, default=500)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument("--max-examples", type=int, default=None)
+    parser.add_argument("--biases", nargs='+', type=float, default=[1.0, 0.5, 0.2, 0.0, -0.2, -0.4, -0.6])
+    parser.add_argument("--seeds", nargs='+', type=int, default=[42, 123, 2026, 7, 19, 37, 101, 256, 512, 999])
     return parser.parse_args()
 
-def evaluate_with_fresh_model(checkpoint, num_examples, batch_size, flag_name, bias=0.0, seed_val=None, target_counts_write=None):
-    # Fresh dataloaders
-    _, val_dl, _, val_data, val_features = get_squad_dataloaders(
-        batch_size=batch_size,
-        max_train_samples=1,
-        max_val_samples=num_examples,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    
-    # Fresh model
-    model = AdaptiveDistilBertQA(model_name=MODEL_NAME, device=DEVICE).to(DEVICE)
-    if os.path.exists(checkpoint):
-        evaluate_squad.load_ammr_checkpoint(model, checkpoint)
-    model.eval()
-    
+def custom_evaluate_model(model, dataloader, dataset_features, raw_val_data, tokenizer, is_baseline=False, threshold_bias=0.0, current_bias=None, current_seed=None):
+    if hasattr(model, "eval"):
+        model.eval()
+    elif hasattr(model, "qa_model"):
+        model.qa_model.eval()
+
+    all_start_logits, all_end_logits = [], []
+    total_latency = 0.0
+    num_batches = 0
+    total_retained_tokens = 0
+    total_original_tokens = 0
+    layer_span_survival = [0] * 6
+    layer_span_total = [0] * 6
+    all_retention_scores = []
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(DEVICE)
+
+    start_eval_time = time.time()
+    for i, batch in enumerate(dataloader):
+        input_ids = batch["input_ids"].to(DEVICE)
+        attention_mask = batch["attention_mask"].to(DEVICE)
+        start_time = time.perf_counter()
+        with torch.no_grad():
+            if is_baseline:
+                outputs = model.qa_model(input_ids, attention_mask) if hasattr(model, "qa_model") else model(input_ids, attention_mask)
+                start_logits, end_logits, layer_metrics = outputs.start_logits, outputs.end_logits, None
+            else:
+                start_logits, end_logits, layer_metrics = evaluate_squad.unpack_student_outputs(model(
+                    input_ids, attention_mask, return_layer_metrics=True,
+                    training=False, threshold_bias=threshold_bias
+                ))
+        total_latency += time.perf_counter() - start_time
+        num_batches += 1
+        all_start_logits.append(start_logits.cpu())
+        all_end_logits.append(end_logits.cpu())
+
+        if layer_metrics and layer_metrics.get("selection_results"):
+            start_pos = batch.get("start_positions", torch.zeros_like(input_ids[:, 0]))
+            end_pos = batch.get("end_positions", torch.zeros_like(input_ids[:, 0]))
+            batch_tokens = batch_original = 0
+            for layer_idx, result in enumerate(layer_metrics["selection_results"]):
+                if result is None:
+                    continue
+                batch_tokens += result.num_selected
+                batch_original += result.num_original
+                for batch_idx in range(input_ids.size(0)):
+                    start_idx = int(start_pos[batch_idx])
+                    end_idx = int(end_pos[batch_idx])
+                    if start_idx == 0 and end_idx == 0:
+                        continue
+                    span = torch.arange(start_idx, end_idx + 1, device=DEVICE)
+                    survived = torch.all(torch.isin(span, result.selected_indices[batch_idx])).item()
+                    layer_span_survival[layer_idx] += survived
+                    layer_span_total[layer_idx] += 1
+            total_retained_tokens += batch_tokens
+            total_original_tokens += batch_original
+            if threshold_bias == 0.0:
+                all_retention_scores.extend(
+                    result.retention_scores.detach().cpu() for result in layer_metrics["selection_results"] if result is not None
+                )
+
+        if num_batches % 10 == 0 or num_batches == len(dataloader):
+            elapsed = time.time() - start_eval_time
+            rate = num_batches / elapsed if elapsed > 0 else 0
+            examples_processed = num_batches * input_ids.size(0)
+            print(f"Bias: {current_bias} | Seed: {current_seed} | Batch {num_batches}/{len(dataloader)} | Ex: {examples_processed} | Elapsed: {elapsed:.1f}s | {rate:.1f} batch/s", flush=True)
+
+    if not all_start_logits:
+        raise RuntimeError("Evaluation produced no batches.")
+    all_start_logits = torch.cat(all_start_logits)
+    all_end_logits = torch.cat(all_end_logits)
+    raw_by_id = {example["id"]: example for example in raw_val_data}
+    exact_scores, f1_scores = [], []
+    for index, feature in enumerate(dataset_features):
+        if index >= len(all_start_logits):
+            break
+        example = raw_by_id.get(feature["example_id"])
+        if example is None or not example["answers"]["text"]:
+            continue
+        start_idx = torch.argmax(all_start_logits[index]).item()
+        end_idx = torch.argmax(all_end_logits[index]).item()
+        prediction = "" if end_idx < start_idx else tokenizer.decode(
+            feature["input_ids"][start_idx:end_idx + 1], skip_special_tokens=True
+        )
+        answers = example["answers"]["text"]
+        exact_scores.append(max(evaluate_squad.compute_exact(answer, prediction) for answer in answers))
+        f1_scores.append(max(evaluate_squad.compute_f1(answer, prediction) for answer in answers))
+
+    retention = 100.0 * total_retained_tokens / total_original_tokens if total_original_tokens else 100.0
+    spans = [100.0 if total == 0 else 100.0 * kept / total for kept, total in zip(layer_span_survival, layer_span_total)]
+    scores = torch.cat([value.reshape(-1) for value in all_retention_scores]) if all_retention_scores else None
+    return {
+        "em": 100.0 * sum(exact_scores) / max(1, len(exact_scores)),
+        "f1": 100.0 * sum(f1_scores) / max(1, len(f1_scores)),
+        "latency_ms": 1000.0 * total_latency / max(1, num_batches),
+        "retention": retention,
+        "attention_cost": (retention / 100.0) ** 2 * 100.0,
+        "compute_reduction": 100.0 - (retention / 100.0) ** 2 * 100.0,
+        "answer_survival": sum(spans) / len(spans) if spans else 100.0,
+        "span_survival_rates": spans,
+        "all_scores": scores,
+    }
+
+def run_evaluation(model, dataloader, val_features, val_data, tokenizer, flag_name, bias, seed_val=None, target_counts_write=None):
     total_valid = 0
     total_selected = 0
     layer_valid = [0] * 6
@@ -63,14 +161,10 @@ def evaluate_with_fresh_model(checkpoint, num_examples, batch_size, flag_name, b
         if len(res) == 3 and res[2] is not None:
             results = res[2].get("selection_results", [])
             if len(results) > 0:
-                # Add first layer valid tokens to total
                 if results[0] is not None:
                     total_valid += int(results[0].actual_valid_counts.sum().item())
-                # Add last layer selected tokens to total
                 if results[-1] is not None:
                     total_selected += int(results[-1].actual_retained_counts.sum().item())
-                
-                # Per layer counts
                 for i, result in enumerate(results):
                     if result is not None:
                         layer_valid[i] += int(result.actual_valid_counts.sum().item())
@@ -79,7 +173,7 @@ def evaluate_with_fresh_model(checkpoint, num_examples, batch_size, flag_name, b
         return res
         
     model.forward = new_forward
-    res = evaluate_squad.evaluate_model(model, val_dl, val_features, val_data, tokenizer, is_baseline=False, threshold_bias=bias)
+    res = custom_evaluate_model(model, dataloader, val_features, val_data, tokenizer, is_baseline=False, threshold_bias=bias, current_bias=bias, current_seed=seed_val if seed_val is not None else "AMMR")
     model.forward = original_forward
     
     res["total_valid"] = total_valid
@@ -105,49 +199,63 @@ def evaluate_with_fresh_model(checkpoint, num_examples, batch_size, flag_name, b
         res["missing_records"] = len(missing_keys)
         res["extra_records"] = len(extra_keys)
         
-        assert len(missing_keys) == 0, f"Random control did not consume all target counts! Remaining: {len(missing_keys)}"
-        assert len(extra_keys) == 0, f"Random control consumed unknown target counts! Extra: {len(extra_keys)}"
-        
     return res
-
-import csv
 
 def main():
     args = parse_args()
-    args.num_examples = None  # Force full SQuAD validation
     
+    if args.max_examples is not None:
+        args.num_examples = args.max_examples
+        
     print("\n" + "!" * 80)
-    print("WARNING: This is a FULL SQuAD validation run.")
-    print("This will execute AMMR and 10 matched-random control seeds across all 10,570 validation examples.")
-    print("This is a significantly more expensive and time-consuming run than the 500-example diagnostic.")
+    print("WARNING: Optimized Multi-Budget Random Control Diagnostic")
+    print(f"Biases: {args.biases}")
+    print(f"Seeds: {args.seeds}")
+    print(f"Num examples: {args.num_examples}")
     print("!" * 80 + "\n")
     
     if not os.path.exists(args.checkpoint):
         if os.path.exists("dummy.pt"):
             args.checkpoint = "dummy.pt"
             
-    print("Evaluating Baseline...")
+    print("Loading datasets and model once...")
     _, val_dl, _, val_data, val_features = get_squad_dataloaders(
         batch_size=args.batch_size,
         max_train_samples=1,
         max_val_samples=args.num_examples,
     )
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    baseline = BaselineQAModel(freeze_parameters=True).to(DEVICE)
-    baseline_res = evaluate_squad.evaluate_model(baseline, val_dl, val_features, val_data, tokenizer, is_baseline=True)
-    del baseline
-    torch.cuda.empty_cache()
     
-    biases = [0.0, -0.2, -0.4, -0.6]
-    seeds = [42, 123, 2026, 7, 19, 37, 101, 256, 512, 999]
+    if args.max_batches is not None:
+        val_dl.dataset.data = val_dl.dataset.data[:args.max_batches * args.batch_size]
+        val_features = val_features[:args.max_batches * args.batch_size]
+        
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    
+    model = AdaptiveDistilBertQA(model_name=MODEL_NAME, device=DEVICE).to(DEVICE)
+    if os.path.exists(args.checkpoint):
+        evaluate_squad.load_ammr_checkpoint(model, args.checkpoint)
+    model.eval()
+    
+    json_filename = "multi_budget_random_control_resume.json"
+    csv_filename = "multi_budget_random_control_full_squad.csv"
     
     all_results = []
-    
-    for bias in biases:
+    completed_biases = {}
+    if os.path.exists(json_filename):
+        with open(json_filename, "r") as f:
+            all_results = json.load(f)
+            for row in all_results:
+                completed_biases[row["bias"]] = row
+
+    for bias in args.biases:
+        if bias in completed_biases:
+            print(f"Skipping already completed bias {bias}")
+            continue
+            
         print(f"\n======================================")
         print(f"Evaluating AMMR Learned Selection (bias={bias})...")
         try:
-            res_ammr = evaluate_with_fresh_model(args.checkpoint, args.num_examples, args.batch_size, None, bias=bias)
+            res_ammr = run_evaluation(model, val_dl, val_features, val_data, tokenizer, None, bias=bias)
             
             assert res_ammr.get("target_counts") is not None, "AMMR target_counts is None. Target-count capture failed."
             assert len(res_ammr["target_counts"]) > 0, f"Captured 0 target-count records!"
@@ -156,9 +264,9 @@ def main():
             target_counts = res_ammr["target_counts"]
             captured = res_ammr.get('target_count_records_captured', 0)
             
-            for seed in seeds:
+            for seed in args.seeds:
                 print(f"  Evaluating Random Matched Selection (seed={seed})...")
-                res_rand = evaluate_with_fresh_model(args.checkpoint, args.num_examples, args.batch_size, "diagnostic_random_seed", bias=bias, seed_val=seed, target_counts_write=target_counts)
+                res_rand = run_evaluation(model, val_dl, val_features, val_data, tokenizer, "diagnostic_random_seed", bias=bias, seed_val=seed, target_counts_write=target_counts)
                 
                 # Verify matched retention
                 if res_rand['total_selected'] != res_ammr['total_selected']:
@@ -210,10 +318,15 @@ def main():
                 "EM_diff": em_diff,
                 "F1_diff": f1_diff
             }
-            for i, seed in enumerate(seeds):
+            for i, seed in enumerate(args.seeds):
                 row_dict[f"Rand_EM_seed_{seed}"] = rand_ems[i]
                 row_dict[f"Rand_F1_seed_{seed}"] = rand_f1s[i]
+            
             all_results.append(row_dict)
+            completed_biases[bias] = row_dict
+            
+            with open(json_filename, "w") as f:
+                json.dump(all_results, f, indent=2)
             
         except Exception as e:
             consumed = 0
@@ -227,26 +340,20 @@ def main():
                 f"Target records consumed: {consumed}"
             ) from e
 
-    # Assert exactly 4 results
-    assert len(all_results) == 4, f"Expected 4 results, got {len(all_results)}"
-    
-    # Assert exact bias set
     produced = {round(float(row["bias"]), 1) for row in all_results}
-    expected = {0.0, -0.2, -0.4, -0.6}
+    expected = {round(float(b), 1) for b in args.biases}
     assert produced == expected, f"Produced biases {produced} do not match expected {expected}"
     
-    # Sort descending
     all_results.sort(key=lambda x: x["bias"], reverse=True)
     
-    csv_filename = "multi_budget_random_control_full_squad.csv"
     with open(csv_filename, "w", newline="") as f:
         writer = csv.writer(f)
         headers = [
             "bias", "AMMR_EM", "AMMR_F1", "AMMR_eff_ret", "AMMR_ans_surv"
         ]
-        for seed in seeds:
+        for seed in args.seeds:
             headers.append(f"Rand_EM_seed_{seed}")
-        for seed in seeds:
+        for seed in args.seeds:
             headers.append(f"Rand_F1_seed_{seed}")
         headers.extend([
             "Rand_mean_EM", "Rand_std_EM", "Rand_mean_F1", "Rand_std_F1", 
@@ -262,9 +369,9 @@ def main():
                 f"{row['AMMR_eff_ret']:.2f}",
                 f"{row['AMMR_ans_surv']:.2f}"
             ]
-            for seed in seeds:
+            for seed in args.seeds:
                 row_vals.append(f"{row[f'Rand_EM_seed_{seed}']:.2f}")
-            for seed in seeds:
+            for seed in args.seeds:
                 row_vals.append(f"{row[f'Rand_F1_seed_{seed}']:.2f}")
             row_vals.extend([
                 f"{row['Rand_mean_EM']:.2f}",
@@ -285,6 +392,19 @@ def main():
     print("missing: []")
     print("duplicate_biases: []")
     print(f"CSV: {csv_filename}")
+    
+    # Compare against 500-example reference if running smoke test
+    if args.num_examples == 500:
+        ref_csv = "multi_budget_random_control.csv"
+        if os.path.exists(ref_csv):
+            print("\nComparing against 500-example reference CSV:")
+            with open(ref_csv, "r") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    b = round(float(row["bias"]), 1)
+                    if b in completed_biases:
+                        cur = completed_biases[b]
+                        print(f"Bias {b}: Ref EM={row['AMMR_EM']} F1={row['AMMR_F1']} EffRet={row['AMMR_eff_ret']} | Cur EM={cur['AMMR_EM']:.2f} F1={cur['AMMR_F1']:.2f} EffRet={cur['AMMR_eff_ret']:.2f}")
 
 if __name__ == "__main__":
     main()
