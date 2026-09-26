@@ -274,10 +274,13 @@ def main():
         with open(json_filename, "r") as f:
             all_results = json.load(f)
             for row in all_results:
-                completed_biases[row["bias"]] = row
+                row_seeds = tuple(sorted(int(k.split("_")[-1]) for k in row.keys() if k.startswith("Rand_EM_seed_")))
+                expected_seeds = tuple(sorted(args.seeds))
+                if row_seeds == expected_seeds:
+                    completed_biases[round(float(row["bias"]), 3)] = row
 
     for bias in args.biases:
-        if bias in completed_biases:
+        if round(float(bias), 3) in completed_biases:
             print(f"Skipping already completed bias {bias}")
             continue
             
@@ -352,7 +355,7 @@ def main():
                 row_dict[f"Rand_F1_seed_{seed}"] = rand_f1s[i]
             
             all_results.append(row_dict)
-            completed_biases[bias] = row_dict
+            completed_biases[round(float(bias), 3)] = row_dict
             
             with open(json_filename, "w") as f:
                 json.dump(all_results, f, indent=2)
@@ -369,14 +372,22 @@ def main():
                 f"Target records consumed: {consumed}"
             ) from e
 
+    logical_records = []
+    for row in all_results:
+        b = round(float(row["bias"]), 3)
+        row_seeds = tuple(sorted(int(k.split("_")[-1]) for k in row.keys() if k.startswith("Rand_EM_seed_")))
+        logical_records.append((b, row_seeds))
+        
     from collections import Counter
-    produced_counts = Counter(round(float(row["bias"]), 1) for row in all_results)
-    expected = {round(float(b), 1) for b in args.biases}
-    missing = [b for b in expected if produced_counts[b] == 0]
-    duplicates = [b for b, count in produced_counts.items() if count > 1]
+    produced_counts = Counter(logical_records)
+    duplicates = [rec for rec, count in produced_counts.items() if count > 1]
+    assert not duplicates, f"Duplicate logical records found: {duplicates}"
+
+    expected_seeds = tuple(sorted(args.seeds))
+    completed_biases_for_current_run = set(rec[0] for rec in logical_records if rec[1] == expected_seeds)
+    missing = [b for b in args.biases if round(float(b), 3) not in completed_biases_for_current_run]
     
     assert not missing, f"Expected biases {missing} are missing from accumulated results."
-    assert not duplicates, f"Biases {duplicates} appear multiple times in accumulated results."
     
     all_results.sort(key=lambda x: x["bias"], reverse=True)
     
@@ -397,16 +408,18 @@ def main():
         
         for row in all_results:
             row_vals = [
-                f"{row['bias']:.1f}",
+                f"{row['bias']:.3f}",
                 f"{row['AMMR_EM']:.2f}",
                 f"{row['AMMR_F1']:.2f}",
                 f"{row['AMMR_eff_ret']:.2f}",
                 f"{row['AMMR_ans_surv']:.2f}"
             ]
             for seed in args.seeds:
-                row_vals.append(f"{row[f'Rand_EM_seed_{seed}']:.2f}")
+                val = row.get(f"Rand_EM_seed_{seed}")
+                row_vals.append(f"{val:.2f}" if val is not None else "N/A")
             for seed in args.seeds:
-                row_vals.append(f"{row[f'Rand_F1_seed_{seed}']:.2f}")
+                val = row.get(f"Rand_F1_seed_{seed}")
+                row_vals.append(f"{val:.2f}" if val is not None else "N/A")
             row_vals.extend([
                 f"{row['Rand_mean_EM']:.2f}",
                 f"{row['Rand_std_EM']:.2f}",
@@ -422,7 +435,7 @@ def main():
     print(f"\n======================================")
     print("COMPLETE MULTI-BUDGET SWEEP")
     print(f"rows: {len(all_results)}")
-    print(f"biases: {[round(r['bias'], 1) for r in all_results]}")
+    print(f"biases: {[round(r['bias'], 3) for r in all_results]}")
     print("missing: []")
     print("duplicate_biases: []")
     print(f"CSV: {csv_filename}")
@@ -435,7 +448,7 @@ def main():
             with open(ref_csv, "r") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    b = round(float(row["bias"]), 1)
+                    b = round(float(row["bias"]), 3)
                     if b in completed_biases:
                         cur = completed_biases[b]
                         print(f"Bias {b}: Ref EM={row['AMMR_EM']} F1={row['AMMR_F1']} EffRet={row['AMMR_eff_ret']} | Cur EM={cur['AMMR_EM']:.2f} F1={cur['AMMR_F1']:.2f} EffRet={cur['AMMR_eff_ret']:.2f}")
