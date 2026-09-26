@@ -369,9 +369,14 @@ def main():
                 f"Target records consumed: {consumed}"
             ) from e
 
-    produced = {round(float(row["bias"]), 1) for row in all_results}
+    from collections import Counter
+    produced_counts = Counter(round(float(row["bias"]), 1) for row in all_results)
     expected = {round(float(b), 1) for b in args.biases}
-    assert produced == expected, f"Produced biases {produced} do not match expected {expected}"
+    missing = [b for b in expected if produced_counts[b] == 0]
+    duplicates = [b for b, count in produced_counts.items() if count > 1]
+    
+    assert not missing, f"Expected biases {missing} are missing from accumulated results."
+    assert not duplicates, f"Biases {duplicates} appear multiple times in accumulated results."
     
     all_results.sort(key=lambda x: x["bias"], reverse=True)
     
