@@ -230,10 +230,10 @@ class TokenSelector:
         # ------------------------------------------------------------
         if diagnostic_force_all_retain:
             # To be mathematically identical to ordinary DistilBert computation,
-            # we must retain EVERYTHING, including padding tokens, and set z=1.0 for EVERYTHING.
-            # Otherwise, zeroing padding tokens causes their layer outputs to diverge from the baseline!
-            keep_mask = torch.ones_like(valid_tokens)
-            z = torch.ones_like(z)
+            # we must retain all VALID tokens (so they don't get dropped by compaction)
+            keep_mask = valid_tokens.clone()
+            # But we must set z=1.0 for valid tokens, and z=0.0 for padding tokens
+            z = torch.where(valid_tokens, torch.ones_like(z), torch.zeros_like(z))
         else:
             keep_mask = z > 0
 
